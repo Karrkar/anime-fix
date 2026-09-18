@@ -1,0 +1,16 @@
+{
+  "crons": [
+    {
+      "path": "/api/sync-anime?pages=2&ongoing=2&refresh=15",
+      "schedule": "0 6 * * *"
+    },
+    {
+      "path": "/api/sync-hentai?pages=1",
+      "schedule": "0 6 * * *"
+    },
+    {
+      "path": "/api/sync-games",
+      "schedule": "30 6 * * *"
+    }
+  ]
+}

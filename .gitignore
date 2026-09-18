@@ -1,0 +1,25 @@
+# Зависимости и сборка
+node_modules/
+.next/
+out/
+build/
+dist/
+
+# Vercel CLI (локальная связка — не для репозитория)
+.vercel/
+
+# Секреты — НИКОГДА не в git
+.env
+.env.*
+!.env.example
+
+# Кэш и артефакты
+*.tsbuildinfo
+.eslintcache
+.cache/
+coverage/
+
+# Системное
+.DS_Store
+Thumbs.db
+*.log
