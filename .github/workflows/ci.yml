@@ -1,0 +1,72 @@
+# CI/CD: quality gate + авто-деплой в прод (замена «слепых» деплоев через API).
+#   job ci     — строгий typecheck (tsc --noEmit), юнит-тесты, аудит
+#                прод-зависимостей и контрольная сборка;
+#   job deploy — на push в main/master: vercel pull (тянет env из проекта)
+#                → vercel build → vercel deploy --prebuilt --prod.
+# Требуется ОДИН секрет репозитория: VERCEL_TOKEN
+# (GitHub → Settings → Secrets and variables → Actions → New repository secret).
+name: CI/CD
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    env:
+      # Фиктивные env ТОЛЬКО для сборки в CI — реальные секреты живут в Vercel
+      NEXT_PUBLIC_SUPABASE_URL: https://placeholder.supabase.co
+      SUPABASE_SERVICE_ROLE_KEY: ci-placeholder
+      YOO_MONEY_SECRET: ci-placeholder
+      CRON_SECRET: ci-placeholder
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Установка зависимостей
+        run: npm ci
+
+      - name: Строгий typecheck (tsc --noEmit)
+        run: npm run typecheck
+
+      - name: Юнит-тесты (node:test)
+        run: npm test
+
+      - name: Аудит прод-зависимостей (high+)
+        run: npm audit --omit=dev --audit-level=high
+
+      - name: Контрольная сборка
+        run: npm run build
+
+  deploy:
+    needs: ci
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+    runs-on: ubuntu-latest
+    env:
+      VERCEL_ORG_ID: team_xOPhiiFM1i6WnWYJsq5WgTnt
+      VERCEL_PROJECT_ID: prj_R5mRaKfsIwJ7WtArZyPWOBEkypja
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Установка Vercel CLI
+        run: npm install -g vercel@latest
+
+      - name: Связка с проектом и выгрузка env (без секретов в репозитории)
+        run: vercel pull --yes --environment=production --token=${{ secrets.VERCEL_TOKEN }}
+
+      - name: Сборка с прод-конфигурацией
+        run: vercel build --prod --token=${{ secrets.VERCEL_TOKEN }}
+
+      - name: Деплой в прод (prebuilt)
+        run: vercel deploy --prebuilt --prod --token=${{ secrets.VERCEL_TOKEN }}
