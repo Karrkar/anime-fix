@@ -126,3 +126,4 @@ vercel deploy --prebuilt --prod
   `ADMIN_EMAIL` / `ADMIN_PASSWORD` из env.
 - `NEXT_PUBLIC_SUPABASE_ANON_KEY` задан в env, но кодом не используется
   (клиент полностью опосредуется серверными роутами).
+  CI test 18.09
