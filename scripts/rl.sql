@@ -1,0 +1,1 @@
+CREATE TABLE IF NOT EXISTS public.rate_limits (id BIGSERIAL PRIMARY KEY, bucket_key TEXT NOT NULL, ip TEXT NOT NULL DEFAULT '', created_at TIMESTAMPTZ DEFAULT NOW()); CREATE UNIQUE INDEX IF NOT EXISTS idx_rl_bucket ON public.rate_limits(bucket_key, ip); CREATE INDEX IF NOT EXISTS idx_rl_created ON public.rate_limits(created_at);
