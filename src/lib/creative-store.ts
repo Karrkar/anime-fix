@@ -311,7 +311,10 @@ export async function mirrorPostMedia(
   while (photoDims.length < photos.length) photoDims.push(null);
   for (let i = 0; i < Math.min(photos.length, MIRROR_MAX_PHOTOS); i++) {
     if (isOwnStorageUrl(photos[i])) continue;
-    const mirrored = await mirrorImage(photos[i], `${post.channel}-${base}-p${i + 1}`);
+    // -nN: новые зеркала не должны конфликтовать с легаси -pN — после
+    // вырезания аватаров из парса позиции сдвинулись, и -pN может быть
+    // занят зеркалом ДРУГОГО фото этого же поста.
+    const mirrored = await mirrorImage(photos[i], `${post.channel}-${base}-n${i + 1}`);
     if (mirrored) {
       photos[i] = mirrored.url;
       photoDims[i] = { w: mirrored.w, h: mirrored.h };
@@ -320,7 +323,7 @@ export async function mirrorPostMedia(
   let videoPoster = post.videoPoster;
   let posterDims = post.posterDims || null;
   if (videoPoster && !isOwnStorageUrl(videoPoster)) {
-    const m = await mirrorImage(videoPoster, `${post.channel}-${base}-v`);
+    const m = await mirrorImage(videoPoster, `${post.channel}-${base}-nv`);
     if (m) {
       videoPoster = m.url;
       posterDims = { w: m.w, h: m.h };
