@@ -7,7 +7,6 @@ import {
   MERGE_PAGE,
   PAGE_SIZE,
   loadDepth,
-  mergePosts,
   mirrorPostMedia,
   normalizePost,
   pageFromRow,
@@ -162,8 +161,20 @@ export async function GET(request: NextRequest) {
         perChannel.push(lp.filter(p => !cursorB[ch] || p.msgId < cursorB[ch]));
       }
     }
-    // mergePosts отдаёт сортировку по msgId desc и дедуп
-    const flat = mergePosts([], perChannel.flat()).slice(0, limit + 1);
+    // Лента «все каналы»: сортировка по ДАТЕ (msgId несопоставим между
+    // каналами — у simple_elf IDs ~8500, у art_Hub_ai ~2400, из-за этого
+    // верх ленты целиком занимал один канал с крупными ID).
+    // Дедуп не нужен: посты уже уникальны по id ("<ch>/<msgId>") в рамках
+    // своей строки depth-хранилища.
+    const byDateDesc = (a: StoredCreativePost, b: StoredCreativePost): number => {
+      const da = a.date || '';
+      const db_ = b.date || '';
+      if (da && db_) return da === db_ ? b.msgId - a.msgId : da < db_ ? 1 : -1;
+      if (da) return -1;
+      if (db_) return 1;
+      return b.msgId - a.msgId;
+    };
+    const flat = perChannel.flat().sort(byDateDesc).slice(0, limit + 1);
     hasMore = flat.length > limit;
     const page = flat.slice(0, limit);
     // Курсор — минимальный msgId каждого канала на этой странице
