@@ -51,6 +51,9 @@ const DATA_POST_RE = /data-post="[^"]+\/(\d+)"/g;
 const TIME_RE = /<time[^>]+datetime="([^"]+)"/i;
 const VIDEO_RE = /tgme_widget_message_video_(?:player|thumb)/i;
 const TEXT_BLOCK_RE = /<div[^>]+class="[^"]*tgme_widget_message_text[^"]*"[^>]*>([\s\S]*?)<\/div>/i;
+// Аватар канала в шапке каждого сообщения тоже лежит на cdn*.telesco.pe.
+// Без вырезания он попадает в photos[0] КАЖДОГО поста (160x160).
+const AVATAR_DIV_RE = /<div class="tgme_widget_message_user">[\s\S]*?<\/div>/i;
 
 function decodeEntities(s: string): string {
   return s
@@ -88,7 +91,8 @@ export function parseTelegramHtml(html: string): TgRawPost[] {
   for (let i = 0; i < anchors.length; i++) {
     const { idx, msgId } = anchors[i];
     const end = i + 1 < anchors.length ? anchors[i + 1].idx : Math.min(html.length, idx + 30_000);
-    const block = html.slice(idx, end);
+    // Вырезаем аватар канала ДО сбора URL — иначе он станет photos[0]
+    const block = html.slice(idx, end).replace(AVATAR_DIV_RE, '');
 
     // Дедуп URL внутри поста (превью+фото часто дублируются)
     const urls: string[] = [];
