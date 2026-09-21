@@ -137,6 +137,10 @@ export async function GET(request: NextRequest) {
     const page = pageFromRow(depths[i], channelParam, cursorB[channelParam], limit);
     if (depths[i]) {
       posts = page.posts;
+      // ФИКС: hasMore/nextCursor из pageFromRow раньше отбрасывались —
+      // в режиме одного канала «Загрузить ещё» не появлялось никогда.
+      hasMore = page.hasMore;
+      nextCursor = page.nextCursor;
     } else if (liveParts[0]) {
       const live = liveParts[0].posts;
       const filtered = cursorB[channelParam]

@@ -102,7 +102,7 @@ export function toClientPost(p: StoredCreativePost | ClientCreativePost): Client
   const out: ClientCreativePost = {
     id: p.id,
     channel: p.channel,
-    channelTitle: p.channelTitle,
+    channelTitle: p.channelTitle || channelTitle(p.channel),
     msgId: p.msgId,
     date: p.date,
     caption: p.caption || '',
