@@ -11,6 +11,18 @@
     {
       "path": "/api/sync-games",
       "schedule": "30 6 * * *"
+    },
+    {
+      "path": "/api/creative-sync?depth=2&mirror=30",
+      "schedule": "0 7 * * *"
+    },
+    {
+      "path": "/api/player-warm?slice=0",
+      "schedule": "20 6 * * *"
+    },
+    {
+      "path": "/api/player-warm?slice=1",
+      "schedule": "30 6 * * *"
     }
   ]
 }

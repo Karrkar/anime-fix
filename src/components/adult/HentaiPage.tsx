@@ -3,10 +3,11 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import Image from 'next/image';
-import { Search, Star, ChevronLeft, ChevronRight, X, ImageIcon, List, Filter, SortAsc, Flame, Tag, ExternalLink, Gamepad2, MessageCircle } from 'lucide-react';
+import { Search, Star, ChevronLeft, ChevronRight, X, ImageIcon, List, Filter, SortAsc, Flame, Tag, ExternalLink, Gamepad2, MessageCircle, Sparkles } from 'lucide-react';
 import { LilithChat } from '@/app/chat-widget';
 import { ArtViewerImage, HentaiCard } from '@/components/adult/AdultCards';
 import { AgeGate } from '@/components/adult/AgeGate';
+import { CreativeTab } from '@/components/adult/CreativeTab';
 import { ADULT_VERIFY_KEY, isVerificationValid } from '@/components/adult/adult-verify';
 import { Rule34ArtCard } from '@/components/cards/ArtCards';
 import { SkeletonGrid } from '@/components/ui';
@@ -19,7 +20,7 @@ export function HentaiPage({ onOpen, favorites, onNavigate, toggleFav, hasSubscr
 }) {
   const [verified, setVerified] = useState(isVerificationValid);
   const [allAnime, setAllAnime] = useState<Anime[]>([]);
-  const [tab, setTab] = useState<'catalog' | 'arts' | 'games' | 'lilith'>('catalog');
+  const [tab, setTab] = useState<'catalog' | 'creative' | 'arts' | 'games' | 'lilith'>('catalog');
   const [games, setGames] = useState<{id:string;title:string;titleRussian:string;description:string;imageUrl:string;sourceUrl:string;source:string}[]>([]);
   const [gamesSearch, setGamesSearch] = useState('');
   const [gamesLoading, setGamesLoading] = useState(false);
@@ -248,16 +249,16 @@ export function HentaiPage({ onOpen, favorites, onNavigate, toggleFav, hasSubscr
           </div>
           <div>
             <h1 className="text-2xl font-extrabold">Контент для взрослых</h1>
-            <p className="text-xs text-[var(--muted-foreground)]">{tab === 'catalog' ? `${filteredAnime.length} из ${allAnime.length} тайтлов` : tab === 'arts' ? `${artsTotal} артов` : tab === 'games' ? `${games.length} игр` : 'твой личный суккуб-хранитель'}</p>
+            <p className="text-xs text-[var(--muted-foreground)]">{tab === 'catalog' ? `${filteredAnime.length} из ${allAnime.length} тайтлов` : tab === 'creative' ? 'арты из Telegram-каналов' : tab === 'arts' ? `${artsTotal} артов` : tab === 'games' ? `${games.length} игр` : 'твой личный суккуб-хранитель'}</p>
           </div>
         </div>
       </div>
 
       {/* Tabs */}
       <div className="flex gap-2 mb-6">
-        {([['catalog', 'Каталог', List], ['games', 'Игры', Gamepad2], ['arts', 'Арты', ImageIcon], ['lilith', 'Лилит', MessageCircle]] as const).map(([t, label, Icon]) => (
+        {([['catalog', 'Каталог', List], ['creative', 'Креатив', Sparkles], ['games', 'Игры', Gamepad2], ['arts', 'Арты', ImageIcon], ['lilith', 'Лилит', MessageCircle]] as const).map(([t, label, Icon]) => (
           <button
-            key={t} onClick={() => { setTab(t as 'catalog' | 'arts' | 'games' | 'lilith'); setCurrentPage(1); }}
+            key={t} onClick={() => { setTab(t as 'catalog' | 'creative' | 'arts' | 'games' | 'lilith'); setCurrentPage(1); }}
             className={`flex items-center gap-2 px-4 py-2.5 rounded-xl text-sm font-medium transition-all ${tab === t
               ? 'bg-gradient-to-r from-red-600 to-pink-600 text-white shadow-lg shadow-red-500/20'
               : 'bg-[var(--card)] border border-[var(--border)] text-[var(--muted-foreground)] hover:text-[var(--foreground)] hover:bg-[var(--muted)]'}`}
@@ -272,6 +273,9 @@ export function HentaiPage({ onOpen, favorites, onNavigate, toggleFav, hasSubscr
         <div className="max-w-2xl mx-auto">
           <LilithChat />
         </div>
+      ) : tab === 'creative' ? (
+        /* ── Creative Tab: арты из Telegram-каналов (Task 44/51) ── */
+        <CreativeTab />
       ) : tab === 'games' ? (
         /* ── Games Tab ── */
         <>

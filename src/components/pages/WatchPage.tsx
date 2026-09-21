@@ -118,6 +118,15 @@ export function WatchPage({ animeId, initialEp = 1, onBack, onOpen, favorites, t
     }
     return srcUrl;
   }, [currentEp, anime]);
+
+  // ФИКС 2 (UX): /api/player-proxy при первом заходе на серию может собирать
+  // данные до ~30-45с (анти-бот vost.pw медленно отдаёт страницы; результат
+  // кэшируется на 30 мин — повторы мгновенны). Чтобы это время не выглядело
+  // «плеер не работает», показываем спиннер поверх чёрного ящика iframe.
+  const [playerLoading, setPlayerLoading] = useState(true);
+  useEffect(() => {
+    if (playerUrl) setPlayerLoading(true);
+  }, [playerUrl]);
   // ИСПРАВЛЕНИЕ БАГА #2: key={animeId} на контейнере гарантирует перемонтирование */
 
   // ── Автопереход на следующую серию ──
@@ -232,7 +241,23 @@ export function WatchPage({ animeId, initialEp = 1, onBack, onOpen, favorites, t
         <div className="flex-1 w-full">
           {playerUrl ? (
             <div className="video-container">
-              <iframe key={playerUrl} src={playerUrl} title={`Episode ${currentEp?.episodeNumber || activeEp}`} allowFullScreen allow="autoplay; encrypted-media" />
+              <iframe
+                key={playerUrl}
+                src={playerUrl}
+                title={`Episode ${currentEp?.episodeNumber || activeEp}`}
+                allowFullScreen
+                allow="autoplay; encrypted-media"
+                onLoad={() => setPlayerLoading(false)}
+              />
+              {playerLoading && (
+                <div className="absolute inset-0 z-10 flex flex-col items-center justify-center gap-3 bg-black/85 text-white/90">
+                  <div className="h-10 w-10 rounded-full border-[3px] border-white/20 border-t-purple-400 animate-spin" />
+                  <p className="text-sm text-center px-4">
+                    Загружаем плеер…
+                    <span className="block mt-1 text-xs text-white/50">первый запуск серии может занять до минуты — источник подтормаживает</span>
+                  </p>
+                </div>
+              )}
             </div>
           ) : (
             <div className="w-full aspect-video bg-[var(--card)] rounded-xl flex items-center justify-center text-[var(--muted-foreground)]">

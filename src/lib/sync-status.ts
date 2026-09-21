@@ -66,15 +66,19 @@ export async function getSyncStatus(): Promise<{ rows: SyncStatusRow[]; tableMis
       console.error('getSyncStatus:', error.message);
       return { rows: [], tableMissing: false };
     }
-    const rows = (data || []).map((r: Record<string, unknown>) => ({
-      source: String(r.source || ''),
-      lastRunAt: String(r.last_run_at || ''),
-      lastStatus: String(r.last_status || ''),
-      newItems: Number(r.new_items || 0),
-      updatedItems: Number(r.updated_items || 0),
-      details: (r.details && typeof r.details === 'object' ? r.details : {}) as Record<string, unknown>,
-      error: (r.error as string) || null,
-    }));
+    const rows = (data || [])
+      .map((r: Record<string, unknown>) => ({
+        source: String(r.source || ''),
+        lastRunAt: String(r.last_run_at || ''),
+        lastStatus: String(r.last_status || ''),
+        newItems: Number(r.new_items || 0),
+        updatedItems: Number(r.updated_items || 0),
+        details: (r.details && typeof r.details === 'object' ? r.details : {}) as Record<string, unknown>,
+        error: (r.error as string) || null,
+      }))
+      // ФИКС 3: служебные строки player:* — персистентный кэш плеера
+      // (src/lib/player-cache.ts), в админ-отчёт не попадают
+      .filter((r) => !r.source.startsWith('player:'));
     return { rows, tableMissing: false };
   } catch (e) {
     console.error('getSyncStatus failed:', e);
