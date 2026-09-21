@@ -13,7 +13,7 @@
       "schedule": "30 6 * * *"
     },
     {
-      "path": "/api/creative-sync?depth=2&mirror=30",
+      "path": "/api/creative-sync?depth=2&mirror=40",
       "schedule": "0 7 * * *"
     },
     {

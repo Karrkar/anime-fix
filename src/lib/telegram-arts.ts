@@ -24,6 +24,9 @@ export const TG_CHANNELS: TgChannel[] = [
   { id: 'stefanfalkokmoth', title: 'Stefan Falk' },
   { id: 'simple_elf', title: 'Simple Elf' },
   { id: 'the_horny_ai', title: 'Horny AI' },
+  { id: 'genshin3416', title: 'Genshin R34' },
+  { id: 'StefanFalkokAI', title: 'Stefan Falk AI' },
+  { id: 'ai_harem', title: 'AI Harem' },
 ];
 
 export const TG_CHANNEL_IDS = TG_CHANNELS.map(c => c.id);

@@ -21,11 +21,11 @@ import { TG_CHANNELS, type TgRawPost } from '@/lib/telegram-arts';
 // ─── Константы ─────────────────────────────────────────────────────────────
 
 /** Максимум постов на канал в хранилище (глубина истории). */
-export const DEPTH_CAP = 300;
+export const DEPTH_CAP = 600;
 /** Страница в режиме одного канала. */
-export const PAGE_SIZE = 20;
-/** Страница в режиме «все каналы» (6 × 20). */
-export const MERGE_PAGE = 120;
+export const PAGE_SIZE = 24;
+/** Страница в режиме «все каналы» (6 × 24). */
+export const MERGE_PAGE = 144;
 /** Сколько фото одного поста зеркалим максимум (альбомы длиннее режем). */
 export const MIRROR_MAX_PHOTOS = 9;
 /** Тайтл канала по id (для отдачи метаданных клиенту). */
@@ -43,7 +43,9 @@ export interface StoredCreativePost {
   date: string;          // ISO; пустая строка если t.me не дал время
   caption: string;
   photos: string[];      // зеркала (если mirrored) либо исходные telesco URL
+  photoDims?: Array<PhotoDims | null>; // размеры зеркал, выровнен с photos
   videoPoster?: string;  // зеркальный постер видео
+  posterDims?: PhotoDims | null;
   postUrl: string;       // https://t.me/<ch>/<msgId>
   origPhotos?: string[]; // исходные URL (заполняется при зеркалировании)
   origPoster?: string;
@@ -58,7 +60,9 @@ export interface ClientCreativePost {
   date: string;
   caption: string;
   photos: string[];
+  photoDims?: Array<PhotoDims | null>;
   videoPoster?: string;
+  posterDims?: PhotoDims | null;
   postUrl: string;
 }
 
@@ -70,6 +74,8 @@ export interface DepthRow {
 }
 
 // ─── Нормализация / слияние ────────────────────────────────────────────────
+
+export interface PhotoDims { w: number; h: number }
 
 /** URL в нашем Storage (постоянные зеркала)? */
 export function isOwnStorageUrl(u: string): boolean {
@@ -109,7 +115,9 @@ export function toClientPost(p: StoredCreativePost | ClientCreativePost): Client
     photos: p.photos || [],
     postUrl: p.postUrl,
   };
+  if (p.photoDims?.length) out.photoDims = p.photoDims;
   if (p.videoPoster) out.videoPoster = p.videoPoster;
+  if (p.posterDims) out.posterDims = p.posterDims;
   return out;
 }
 
@@ -245,12 +253,13 @@ function mirrorPath(name: string): string {
 
 /**
  * Качает изображение из Telegram CDN, пережимает (800px, JPEG q74 mozjpeg)
- * и кладёт в постоянный Storage. Возвращает публичный URL или null.
+ * и кладёт в постоянный Storage. Возвращает публичный URL + размеры
+ * (для точного резерва места в masonry-сетке) или null.
  */
 export async function mirrorImage(
   url: string,
   name: string,
-): Promise<string | null> {
+): Promise<{ url: string; w: number; h: number } | null> {
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
       const r = await fetch(url, {
@@ -267,17 +276,18 @@ export async function mirrorImage(
         .rotate()
         .resize({ width: 800, withoutEnlargement: true })
         .jpeg({ quality: 74, mozjpeg: true })
-        .toBuffer();
+        .toBuffer({ resolveWithObject: true });
       const db = getDb();
       const { error } = await db.storage
         .from('covers')
-        .upload(mirrorPath(name), out, { contentType: 'image/jpeg', upsert: true });
+        .upload(mirrorPath(name), out.data, { contentType: 'image/jpeg', upsert: true });
       if (error) {
         console.error(`mirrorImage upload (${name}):`, error.message);
         return null;
       }
       const { data } = db.storage.from('covers').getPublicUrl(mirrorPath(name));
-      return data?.publicUrl || null;
+      const publicUrl = data?.publicUrl || null;
+      return publicUrl ? { url: publicUrl, w: out.info.width, h: out.info.height } : null;
     } catch (e) {
       if (attempt === 1) console.error(`mirrorImage (${name}):`, e);
     }
@@ -287,23 +297,34 @@ export async function mirrorImage(
 
 /**
  * Зеркалирует медиа поста: фото (до MIRROR_MAX_PHOTOS) + постер видео.
- * Успешные позиции заменяются зеркалами, остальные остаются исходными URL.
- * mirrored=true только когда зазеркалено ВСЁ.
+ * Успешные позиции заменяются зеркалами и получают размеры, остальные
+ * остаются исходными URL. mirrored=true только когда зазеркалено ВСЁ.
  */
 export async function mirrorPostMedia(
   post: StoredCreativePost,
 ): Promise<StoredCreativePost> {
   const base = post.msgId; // путь: <ch>-<msgId>-pN / -v
   const photos = [...post.photos];
+  const photoDims: Array<PhotoDims | null> = post.photoDims
+    ? [...post.photoDims]
+    : photos.map(() => null);
+  while (photoDims.length < photos.length) photoDims.push(null);
   for (let i = 0; i < Math.min(photos.length, MIRROR_MAX_PHOTOS); i++) {
     if (isOwnStorageUrl(photos[i])) continue;
     const mirrored = await mirrorImage(photos[i], `${post.channel}-${base}-p${i + 1}`);
-    if (mirrored) photos[i] = mirrored;
+    if (mirrored) {
+      photos[i] = mirrored.url;
+      photoDims[i] = { w: mirrored.w, h: mirrored.h };
+    }
   }
   let videoPoster = post.videoPoster;
+  let posterDims = post.posterDims || null;
   if (videoPoster && !isOwnStorageUrl(videoPoster)) {
     const m = await mirrorImage(videoPoster, `${post.channel}-${base}-v`);
-    if (m) videoPoster = m;
+    if (m) {
+      videoPoster = m.url;
+      posterDims = { w: m.w, h: m.h };
+    }
   }
   const origPhotos = post.origPhotos?.length ? post.origPhotos : post.photos;
   const origPoster = post.origPoster || post.videoPoster;
@@ -314,7 +335,9 @@ export async function mirrorPostMedia(
   return {
     ...post,
     photos,
+    photoDims,
     videoPoster,
+    posterDims,
     origPhotos,
     origPoster,
     mirrored: allMirrored,

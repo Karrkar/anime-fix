@@ -77,8 +77,8 @@ async function topUpChannel(channel: string): Promise<void> {
         }
       }
       if (changed) {
-        // Немного зеркал самым свежим постам (бюджет 6 картинок)
-        let budget = 6;
+        // Немного зеркал самым свежим постам (бюджет 8 картинок)
+        let budget = 8;
         for (let i = 0; i < merged.length && budget > 0; i++) {
           if (!merged[i].mirrored && (merged[i].photos.length || merged[i].videoPoster)) {
             merged[i] = await mirrorPostMedia(merged[i]);
@@ -196,11 +196,31 @@ export async function GET(request: NextRequest) {
   const totalStored = depths.reduce((acc, d) => acc + (d?.posts.length || 0), 0);
   const unavailable = posts.length === 0 && liveCount === 0 && totalStored === 0;
 
+  // Метаданные каналов со счётчиками постов (где известно).
+  // В режиме одного канала счётчики остальных не грузим — клиент сохранит
+  // ранее полученные значения (undefined-поля сериализатор опускает).
+  const channelsOut = TG_CHANNELS.map(c => {
+    const idx = channels.indexOf(c.id);
+    let count: number | undefined;
+    if (idx >= 0) {
+      if (depths[idx]) count = depths[idx]!.posts.length;
+      else {
+        const lp = liveParts.find(x => x.ch === c.id);
+        if (lp) count = lp.posts.length;
+      }
+    }
+    return count === undefined
+      ? { id: c.id, title: c.title }
+      : { id: c.id, title: c.title, count };
+  });
+  const liveStored = liveParts.reduce((acc, lp) => acc + lp.posts.length, 0);
+
   const body = {
     posts,
     hasMore,
     nextCursor,
-    channels: TG_CHANNELS,
+    channels: channelsOut,
+    totalPosts: totalStored + liveStored,
     unavailable,
     tookMs: Date.now() - t0,
   };
