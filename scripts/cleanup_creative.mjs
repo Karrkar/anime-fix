@@ -45,8 +45,8 @@ const AD_HARD_RE = new RegExp(
     '\\bреклам[аыуе]\\b', 'спонсор', 'промокод', 'промо\\s+код', '\\bказино\\b', 'букмекер',
     'ставк[а-яё]*\\s+на\\s', 'подпишись', 'подписывайся', 'подписывайтесь', 'скидк[аи]',
     'стрим', 'ютуб', 'твич', 'прохожден',
-    '(?:новый|второй|запасной|резервный)\\s+канал', 'канал\\s+заблокирован',
-    'технические\\s+проблемы', 'сервис\\s+(?:восстановлен|работает)', 'мы\\s+переехали',
+    '(?:новый|второй|запасной|резервный)\\s+канал', 'канал\\s+заблокирован', 'переехал',
+    'технические\\s+проблемы', 'сервис\\s+(?:восстановлен|работает)',
     'страничк[а-яё]*\\s+на\\s', 'по\\s+вопросам\\s+(?:рекламы|сотрудничества|размещения)',
   ].join('|'),
   'i',
@@ -198,13 +198,21 @@ for (const ch of KEEP_CHANNELS) {
 
   if (!DRY) {
     const details = { ...row.details, posts: kept, savedAt: new Date().toISOString() };
+    // ВАЖНО: body — ОБЪЕКТ (rest() сам его сериализует); передавать строку
+    // нельзя — двойное JSON-кодирование и PostgREST молча не применит патч.
     const { status, text } = await rest(
       `/rest/v1/sync_status?source=eq.${encodeURIComponent(source)}`,
       'PATCH',
-      JSON.stringify({ details, last_run_at: new Date().toISOString() }),
-      { 'Content-Type': 'application/json', Prefer: 'return=minimal' },
+      { details, last_run_at: new Date().toISOString() },
+      { Prefer: 'return=minimal' },
     );
     if (status >= 300) console.log(`   ОШИБКА записи: ${status} ${text.slice(0, 150)}`);
+    else {
+      // контрольная перечитка — урок двойной сериализации
+      const back = await loadRow(source);
+      const n = back?.details?.posts?.length ?? -1;
+      if (n !== kept.length) console.log(`   РАСХОЖДЕНИЕ после записи: ${n} ≠ ${kept.length}`);
+    }
   }
 
   // сэмплы чистки подписей
