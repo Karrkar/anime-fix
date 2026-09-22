@@ -72,7 +72,9 @@ async function topUpChannel(channel: string): Promise<void> {
       let changed = false;
       for (const raw of layer) {
         if (raw.msgId > beforeMax) {
-          merged.unshift(normalizePost(raw, channel));
+          const np = normalizePost(raw, channel);
+          if (!np) continue; // не-арт (текст/реклама) — не храним
+          merged.unshift(np);
           changed = true;
         }
       }
@@ -118,12 +120,16 @@ export async function GET(request: NextRequest) {
   const dbCount = depths.filter(Boolean).length;
 
   // 2) Фолбэк-бутстрап: канал пуст в БД — берём свежий слой из кэша t.me
+  //    (нормализация с фильтром «только арты» — null отбрасываются)
   const liveParts: Array<{ ch: string; posts: StoredCreativePost[] }> = [];
   for (let i = 0; i < channels.length; i++) {
     if (depths[i]) continue;
     const live = await fetchChannelPosts(channels[i]);
     if (live.length) {
-      liveParts.push({ ch: channels[i], posts: live.map(r => normalizePost(r, channels[i])) });
+      const normalized = live
+        .map(r => normalizePost(r, channels[i]))
+        .filter((p): p is StoredCreativePost => p !== null);
+      if (normalized.length) liveParts.push({ ch: channels[i], posts: normalized });
     }
   }
 

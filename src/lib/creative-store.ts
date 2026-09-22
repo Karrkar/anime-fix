@@ -17,6 +17,7 @@
 import sharp from 'sharp';
 import { getDb } from '@/lib/db';
 import { TG_CHANNELS, type TgRawPost } from '@/lib/telegram-arts';
+import { isArtPost, sanitizeCaption } from '@/lib/creative-filter';
 
 // ─── Константы ─────────────────────────────────────────────────────────────
 
@@ -82,8 +83,17 @@ export function isOwnStorageUrl(u: string): boolean {
   return u.includes('/storage/v1/object/public/covers/creative/');
 }
 
-/** TgRawPost -> StoredCreativePost (без зеркалирования; mirrored по URL). */
-export function normalizePost(raw: TgRawPost, channel: string): StoredCreativePost {
+/**
+ * TgRawPost -> StoredCreativePost (без зеркалирования; mirrored по URL).
+ *
+ * 2026-09 «только арты»: пост без визуала, кросс-промо (2+ ссылок в подписи)
+ * или с рекламными маркерами — отбраковывается (null) и не хранится;
+ * подпись проходного поста чистится от промо-футеров автора
+ * (Предложка/Заказать/VIP — сам арт остаётся). Вызыватели обязаны
+ * фильтровать null (см. creative-sync / creative).
+ */
+export function normalizePost(raw: TgRawPost, channel: string): StoredCreativePost | null {
+  if (!isArtPost(raw)) return null;
   const photos = raw.photos || [];
   const mirrored =
     photos.length > 0 &&
@@ -95,7 +105,7 @@ export function normalizePost(raw: TgRawPost, channel: string): StoredCreativePo
     channelTitle: channelTitle(channel),
     msgId: raw.msgId,
     date: raw.date || '',
-    caption: raw.caption || '',
+    caption: sanitizeCaption(raw.caption || ''),
     photos,
     videoPoster: raw.videoPoster,
     postUrl: `https://t.me/${channel}/${raw.msgId}`,

@@ -15,7 +15,13 @@
 
 export interface TgChannel { id: string; title: string }
 
-/** Каналы вкладки «Креатив» — единый источник правды (сервер + метаданные API). */
+/**
+ * Каналы вкладки «Креатив» — единый источник правды (сервер + метаданные API).
+ *
+ * 2026-09: исключены ai_harem (промо-канал чат-бот-сервиса, «публикации»,
+ * не арты) и StefanFalkokAI (ИИ-новости/ссылки на civitai, артов нет) —
+ * по требованию «только тематические арты, без рекламы и публикаций».
+ */
 export const TG_CHANNELS: TgChannel[] = [
   { id: 'pornofullp', title: 'PornoFull' },
   { id: 'art_Hub_ai', title: 'Art Hub AI' },
@@ -25,8 +31,6 @@ export const TG_CHANNELS: TgChannel[] = [
   { id: 'simple_elf', title: 'Simple Elf' },
   { id: 'the_horny_ai', title: 'Horny AI' },
   { id: 'genshin3416', title: 'Genshin R34' },
-  { id: 'StefanFalkokAI', title: 'Stefan Falk AI' },
-  { id: 'ai_harem', title: 'AI Harem' },
 ];
 
 export const TG_CHANNEL_IDS = TG_CHANNELS.map(c => c.id);
@@ -62,6 +66,12 @@ function decodeEntities(s: string): string {
   return s
     .replace(/&quot;/g, '"')
     .replace(/&#39;/g, "'")
+    .replace(/&#(\d+);/g, (_, d) => {
+      try { return String.fromCodePoint(Number(d)); } catch { return ' '; }
+    })
+    .replace(/&#x([0-9a-f]+);/gi, (_, h) => {
+      try { return String.fromCodePoint(parseInt(h, 16)); } catch { return ' '; }
+    })
     .replace(/&lt;/g, '<')
     .replace(/&gt;/g, '>')
     .replace(/&nbsp;/g, ' ')

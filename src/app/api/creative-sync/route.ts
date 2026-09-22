@@ -57,13 +57,18 @@ async function walkChannel(
   let posts: StoredCreativePost[] = depth?.posts || [];
   const beforeCount = posts.length;
 
-  // 1) Свежий слой
+  // 1) Свежий слой (мусорные посты — текст/реклама/кросс-промо — отбрасываются)
   const fresh = await fetchChannelLayerLive(channel);
   res.liveOk = fresh !== null;
   if (fresh && fresh.length > 0) {
-    const next = mergePosts(posts, fresh.map(r => normalizePost(r, channel)));
-    res.freshAdded = next.length - beforeCount;
-    posts = next;
+    const normalized = fresh
+      .map(r => normalizePost(r, channel))
+      .filter((p): p is StoredCreativePost => p !== null);
+    if (normalized.length) {
+      const next = mergePosts(posts, normalized);
+      res.freshAdded = next.length - beforeCount;
+      posts = next;
+    }
   }
 
   // 2) Слои вглубь
@@ -77,9 +82,14 @@ async function walkChannel(
     if (layer === '') { complete = true; break; } // пол истории
     const layerMax = layer[0]?.msgId || 0;
     if (layerMax >= minSaved) { complete = true; break; } // t.me не отдал ниже
-    const next = mergePosts(posts, layer.map(r => normalizePost(r, channel)));
-    res.deepAdded += Math.max(0, next.length - beforeCount - res.freshAdded - res.deepAdded);
-    posts = next;
+    const normalized = layer
+      .map(r => normalizePost(r, channel))
+      .filter((p): p is StoredCreativePost => p !== null);
+    if (normalized.length) {
+      const next = mergePosts(posts, normalized);
+      res.deepAdded += Math.max(0, next.length - beforeCount - res.freshAdded - res.deepAdded);
+      posts = next;
+    }
     layers++;
   }
   if (posts.length >= DEPTH_CAP) complete = true;
