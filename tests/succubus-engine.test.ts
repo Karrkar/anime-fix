@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   classify, extractName, engineReply, detectGenre, mirrorWords,
-  sanitizeProfile, extractProfileDelta, detectMood,
+  sanitizeProfile, extractProfileDelta, detectMood, splitMessengerReply,
   type ChatMsg,
 } from '../src/lib/succubus';
 
@@ -207,4 +207,36 @@ test('detectMood: усталость, радость и нейтраль', () =>
   assert.equal(detectMood([{ role: 'user', content: 'я так устал' }]), 'low');
   assert.equal(detectMood([{ role: 'user', content: 'получилось! ура!' }]), 'high');
   assert.equal(detectMood([]), 'neutral');
+});
+
+test('splitMessengerReply: LLM-ответ по пустым строкам → отдельные сообщения', () => {
+  const parts = splitMessengerReply('*ухмыльнулась* О-о…\n\nЗначит, любишь романтику, хитрец?\n\nРасскажешь, что тебя тронуло?');
+  assert.equal(parts.length, 3);
+  assert.ok(parts[0].startsWith('*ухмыльнулась*'));
+  assert.match(parts[2], /\?$/);
+});
+
+test('splitMessengerReply: не больше 4 пузырьков, пустые вырезаются', () => {
+  const parts = splitMessengerReply('a\n\n\n\nb\n\nc\n\nd\n\ne\n\nf');
+  assert.equal(parts.length, 4);
+});
+
+test('splitMessengerReply: длинная реплика движка режется перед вопросом', () => {
+  const parts = splitMessengerReply('*хихикает, прикрыв рот ладошкой* О, «аниме», значит. Люблю, когда человек знает, чего хочет. Ну и о чём мечтаешь, когда никто не видит?');
+  assert.equal(parts.length, 2);
+  assert.match(parts[1], /\?$/);
+  assert.ok(parts[0].length >= 60);
+});
+
+test('splitMessengerReply: короткая реплика остаётся одним сообщением', () => {
+  assert.equal(splitMessengerReply('Привет, малыш 😏').length, 1);
+  assert.deepEqual(splitMessengerReply(''), ['']);
+});
+
+test('splitMessengerReply: реплика движка не теряет текст при нарезке', () => {
+  const r = engineReply('болтаю просто так', { history: [], recs: RECS });
+  const parts = splitMessengerReply(r);
+  assert.ok(parts.length >= 1 && parts.length <= 2);
+  const norm = (s: string) => s.replace(/\s+/g, ' ').trim();
+  assert.equal(norm(parts.join(' ')), norm(r));
 });

@@ -13,8 +13,10 @@
  *
  * Живость: «шёпот» Лилит на баннере (ротация дразнящих фраз, подстраивается
  * под настроение беседы), плавное «дыхание» арта (CSS), короткие игривые
- * реплики движка (lib/succubus.ts), пауза «набирает текст» перед показом
- * ответа и быстрые ответы-чипы, контекстные к последней реплике.
+ * реплики движка (lib/succubus.ts) и МЕССЕНДЖЕР-ТЕМП: ответ Лилит — это
+ * 2–3 коротких сообщения, каждое приходит отдельным пузырьком с паузой
+ * «набирает текст» между ними — как пишет живой человек, а не простынёй.
+ * Быстрые ответы-чипы контекстны к последнему ходу Лилит (все его пузырьки).
  *
  * Память: профиль собеседника (имя, любимые жанры/тайтлы) живёт в
  * localStorage (lilith_profile_v1), шлётся с каждым запросом и пополняется
@@ -27,7 +29,7 @@
 
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { SendHorizonal, RotateCcw } from 'lucide-react';
-import { extractName, detectGenre, sanitizeProfile, type LilithProfile } from '@/lib/succubus';
+import { extractName, detectGenre, sanitizeProfile, splitMessengerReply as splitReply, type LilithProfile } from '@/lib/succubus';
 
 interface Msg { role: 'user' | 'assistant'; content: string; }
 
@@ -36,7 +38,8 @@ const LS_PROFILE = 'lilith_profile_v1';
 
 const GREETING_FIRST: Msg = {
   role: 'assistant',
-  content: '*выплывает из полумрака и окидывает тебя взглядом* О-о, кто это тут у нас… 💜 Я Лилит — суккуб и хранительница этого места. Со мной скучно не бывает, проверено веками 😏 Рассказывай: за аниме пришёл или ко мне?',
+  content:
+    '*выплывает из полумрака и окидывает тебя взглядом* О-о, кто это тут у нас… 💜\n\nЯ Лилит — суккуб и хранительница этого места. Со мной скучно не бывает, проверено веками 😏\n\nРассказывай: за аниме пришёл или ко мне?',
 };
 
 /** Приветствие зависит от памяти: знакомца Лилит встречает по имени */
@@ -44,10 +47,20 @@ function greetingFor(p: LilithProfile): Msg {
   if (p.name) {
     return {
       role: 'assistant',
-      content: `*выплывает из полумрака и улыбается одним уголком губ* О-о, ${p.name}… а я тебя помню 😏 С возвращением, малыш. Ночь без тебя была неполной — рассказывай, что случилось, пока меня не было? 💜`,
+      content: `*выплывает из полумрака и улыбается одним уголком губ* О-о, ${p.name}… а я тебя помню 😏\n\nС возвращением, малыш. Ночь без тебя была неполной 💜\n\nРассказывай, что случилось, пока меня не было?`,
     };
   }
   return GREETING_FIRST;
+}
+
+// ─── «Мессенджер»-пузырьки ───────────────────────────────────────────────
+// splitReply (он же splitMessengerReply из lib/succubus): ответ Лилит — это
+// 2–3 коротких сообщения через пустую строку (так отвечает LLM), либо
+// одиночная реплика движка, порезанная перед завершающим вопросом.
+
+/** Реплика → несколько Msg-пузырьков (храним и шлём на сервер именно так) */
+function toMsgs(content: string): Msg[] {
+  return splitReply(content).map(c => ({ role: 'assistant' as const, content: c }));
 }
 
 // ─── Профиль-память (localStorage, переживает сброс чата) ────────────────
@@ -102,8 +115,18 @@ const CHIPS_AFTER_CARE = ['Мне уже легче 💜', 'Дай что-ниб
 const CHIPS_AFTER_TEASE = ['Ты загадочная 😏', 'Ладно-ладно, сдаюсь', 'Расскажу о себе'];
 const CHIPS_AFTER_WHO = ['А что ты умеешь?', 'Сколько тебе веков?', 'Подбери мне аниме'];
 
+/** Последний «ход» Лилит: подряд идущие пузырьки (до 4) как один ответ */
+function lastAssistantTurn(msgs: Msg[]): string {
+  const parts: string[] = [];
+  for (let i = msgs.length - 1; i >= 0 && parts.length < 4; i--) {
+    if (msgs[i].role !== 'assistant') break;
+    parts.unshift(msgs[i].content);
+  }
+  return parts.join('\n');
+}
+
 function pickChips(msgs: Msg[]): string[] {
-  const lastA = [...msgs].reverse().find(m => m.role === 'assistant')?.content || '';
+  const lastA = lastAssistantTurn(msgs);
   const t = lastA.toLowerCase();
   if (t.includes('«') && /(подаю|шорт-лист|жемчужин|наудачу|глянь|проверенное|порцию)/.test(t)) return CHIPS_AFTER_REC;
   if (/(устал|груст|слушаю|дверь открыта|на душе|без дразнилок|в темноте)/.test(t)) return CHIPS_AFTER_CARE;
@@ -172,7 +195,7 @@ function useChat() {
         }
       }
     } catch { /* ignore */ }
-    setMsgs(stored && stored.length ? stored : [greetingFor(p)]);
+    setMsgs(stored && stored.length ? stored : toMsgs(greetingFor(p).content));
     setLoaded(true);
   }, []);
 
@@ -200,14 +223,10 @@ function useChat() {
     setMsgs(next);
     setTyping(true);
     try {
-      const d = await apiChat(next.slice(-16), updated);
+      const d = await apiChat(next.slice(-24), updated);
       const reply = typeof d.reply === 'string' && d.reply.trim()
         ? d.reply.trim()
         : 'Ммм... сети нынче скверные, я не расслышала. Повтори, малыш.';
-
-      // Пауза «набирает текст»: реплика приходит не мгновенно — так живее
-      const think = Math.min(1500, 300 + reply.length * 18);
-      await new Promise(res => setTimeout(res, think));
 
       // Сервер мог вынести из реплики имя/жанр/тайтл — вливаем дельту в профиль
       if (d.profileDelta && typeof d.profileDelta === 'object') {
@@ -215,13 +234,27 @@ function useChat() {
         profileRef.current = merged;
         saveProfile(merged);
       }
-      setMsgs([...next, { role: 'assistant', content: reply }]);
+
+      // МЕССЕНДЖЕР-ТЕМП: пузырьки приходят по одному, между ними Лилит снова
+      // «набирает текст» — как живой человек, а не простыня одним куском
+      const parts = splitReply(reply);
+      for (let i = 0; i < parts.length; i++) {
+        const think = i === 0
+          ? Math.min(1400, 350 + parts[i].length * 16)
+          : Math.min(1000, 260 + parts[i].length * 12);
+        await new Promise(res => setTimeout(res, think));
+        const part = parts[i];
+        setMsgs(prev => [...prev, { role: 'assistant', content: part }]);
+        if (i < parts.length - 1) {
+          await new Promise(res => setTimeout(res, 170 + Math.random() * 230));
+        }
+      }
     } catch (e) {
       const fallback = String(e).includes('rate429')
         ? '*поднимает ладошку* Тише-тише, малыш. Слишком много слов за одну минуту — даже у призраков есть лимиты. Выдохни и возвращайся через минутку.'
         : '*огонёк в руке мигнул* Связь с миром духов прервалась на секундочку. Попробуй ещё раз — я никуда не денусь.';
       await new Promise(res => setTimeout(res, 600));
-      setMsgs([...next, { role: 'assistant', content: fallback }]);
+      setMsgs([...next, ...toMsgs(fallback)]);
     } finally {
       setTyping(false);
     }
@@ -229,12 +262,12 @@ function useChat() {
 
   // Сброс = новая беседа, но НЕ забвение: профиль (имя/вкусы) Лилит хранит
   const reset = useCallback(() => {
-    const g = greetingFor(profileRef.current);
-    setMsgs([g]);
-    try { localStorage.setItem(LS_KEY, JSON.stringify([g])); } catch { /* ignore */ }
+    const g = toMsgs(greetingFor(profileRef.current).content);
+    setMsgs(g);
+    try { localStorage.setItem(LS_KEY, JSON.stringify(g)); } catch { /* ignore */ }
   }, []);
 
-  return { msgs: msgs.length ? msgs : [greetingFor(profileRef.current)], typing, loaded, send, reset };
+  return { msgs: msgs.length ? msgs : toMsgs(greetingFor(profileRef.current).content), typing, loaded, send, reset };
 }
 
 // Cache-busting версия арта: при обновлении картинки менять число —
@@ -358,11 +391,18 @@ function Bubble({ m }: { m: Msg }) {
       </div>
     );
   }
+  // Защита от легаси-записей, где «мессенджер»-реплика хранилась одной строкой:
+  // показываем стеком пузырьков под одним аватаром
+  const parts = m.content.split(/\n{2,}/).map(s => s.trim()).filter(Boolean);
   return (
     <div className="flex gap-2 items-end">
       <LilithAvatar size={30} />
-      <div className="max-w-[85%] px-3.5 py-2 rounded-2xl rounded-bl-md text-[14px] leading-snug whitespace-pre-wrap break-words bg-[var(--muted)] text-[var(--foreground)] border border-[var(--border)]">
-        {m.content}
+      <div className="max-w-[85%] space-y-1.5">
+        {(parts.length ? parts : [m.content]).map((p, j) => (
+          <div key={j} className="px-3.5 py-2 rounded-2xl rounded-bl-md text-[14px] leading-snug whitespace-pre-wrap break-words bg-[var(--muted)] text-[var(--foreground)] border border-[var(--border)]">
+            {p}
+          </div>
+        ))}
       </div>
     </div>
   );

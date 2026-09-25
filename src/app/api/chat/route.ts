@@ -26,9 +26,14 @@ import { preferRussianTitle } from '@/lib/anime-utils';
  * (строго санитизируется whitelist-ом), сервер дополняет его дельтой
  * extractProfileDelta() из последней реплики и возвращает в profileDelta —
  * клиент накапливает профиль в localStorage между сессиями.
+ *
+ * Живой диалог: ответ (LLM или движка) — «мессенджер»: 2–3 коротких сообщения
+ * через пустую строку; клиент показывает каждое отдельным пузырьком с паузой
+ * «набирает текст» между ними. История хранится пузырьками (обычные
+ * assistant-сообщения), поэтому LLM видит живой формат диалога.
  */
 
-const MAX_HISTORY = 16;
+const MAX_HISTORY = 24;
 const MAX_MSG_LEN = 1200;
 const STATIC_RECS: RecTitle[] = [
   { title: 'Ван-Пис', genres: 'приключения, фэнтези, сёнэн' },
@@ -89,19 +94,30 @@ async function callLlm(system: string, history: ChatMsg[]): Promise<string | nul
   const model = process.env.LLM_MODEL || 'gpt-4o-mini';
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 9000); // серверлесс-бюджет
+  const buildBody = (withPenalty: boolean) => JSON.stringify({
+    model,
+    messages: [{ role: 'system', content: system }, ...history],
+    max_tokens: 360,
+    temperature: 0.95,
+    ...(withPenalty ? { presence_penalty: 0.6 } : {}), // живее: меньше склонность повторяться
+  });
   try {
-    const r = await fetch(`${baseUrl}/chat/completions`, {
+    let r = await fetch(`${baseUrl}/chat/completions`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
-      body: JSON.stringify({
-        model,
-        messages: [{ role: 'system', content: system }, ...history],
-        max_tokens: 300,
-        temperature: 0.95,
-        presence_penalty: 0.6, // живее: меньше склонность повторяться
-      }),
+      body: buildBody(true),
       signal: controller.signal,
     });
+    if (r.status === 400) {
+      // Некоторые провайдеры (часть OpenRouter/Gemini-совместимых) не принимают
+      // presence_penalty — один повтор без него, прежде чем сдаваться
+      r = await fetch(`${baseUrl}/chat/completions`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
+        body: buildBody(false),
+        signal: controller.signal,
+      });
+    }
     if (!r.ok) {
       // Тело ошибки в лог: 404=model_not_found, 401=ключ, 403=регион/квота —
       // без тела причина не диагностируется
@@ -156,8 +172,8 @@ async function chatHandler(req: NextRequest) {
     logEvent('chat_llm_fallback_engine', {}, 'warn');
   }
 
-  // 2) Встроенный живой движок
-  const reply = engineReply(lastUser.content, { history: history.slice(-8), recs, profile });
+  // 2) Встроенный живой движок (12 последних — с учётом пузырьков это ~3–4 хода)
+  const reply = engineReply(lastUser.content, { history: history.slice(-12), recs, profile });
   return NextResponse.json({ reply, source: 'engine', profileDelta });
 }
 
