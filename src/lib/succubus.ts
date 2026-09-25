@@ -11,6 +11,12 @@
  *  1) buildSystemPrompt()  — системный промпт для полноценного LLM (LLM_API_KEY)
  *  2) engineReply()        — встроенный «живой» движок: интенты, отражение слов,
  *     ролевые действия, вопросы, память имени, реальные рекомендации из БД.
+ *  3) Профиль-память (LilithProfile): имя, любимые жанры/тайтлы. Хранится на
+ *     клиенте (localStorage), присылается с каждым запросом, пополняется
+ *     дельтой extractProfileDelta() из ответа сервера.
+ *  4) Живость: реакции на упомянутые тайтлы, подначки для лаконичных
+ *     сообщений, реакция на оценку рекомендации, тон под настроение
+ *     (detectMood) и расширенные темы болтовни.
  *
  * Каждая реплика собирается из комбинаций (действие × реакция × ядро × вопрос ×
  * структура фразы) — тысячи вариаций, плюс отражение слов пользователя.
@@ -27,13 +33,31 @@ export interface RecTitle {
   id?: string | number;
 }
 
+/** Профиль-память Лилит о собеседнике (живёт на клиенте, серверу — санитизированным). */
+export interface LilithProfile {
+  name?: string;
+  favGenres?: string[];
+  favTitles?: string[];
+  facts?: string[];
+}
+
 // ─── Персона ─────────────────────────────────────────────────────────────
 
 export const LILITH_NAME = 'Лилит';
 export const LILITH_TAGLINE = 'суккуб-хранительница этой платформы';
 
-export function buildSystemPrompt(catalogHint: string): string {
+export function buildSystemPrompt(catalogHint: string, profile?: LilithProfile): string {
+  const knows: string[] = [];
+  if (profile?.name) knows.push(`- Имя собеседника: ${profile.name}`);
+  if (profile?.favGenres?.length) knows.push(`- Любимые жанры: ${profile.favGenres.join(', ')}`);
+  if (profile?.favTitles?.length) knows.push(`- Любимые тайтлы: ${profile.favTitles.map(t => `«${t}»`).join(', ')}`);
+  if (profile?.facts?.length) knows.push(`- Запомнила о нём: ${profile.facts.join('; ')}`);
+  const memory = knows.length
+    ? `ЧТО ТЫ УЖЕ ЗНАЕШЬ О СОБЕСЕДНИКЕ (помни и вплетай в разговор естественно, без канцелярита, не перечисляй списком):\n${knows.join('\n')}`
+    : 'ЧТО ТЫ УЖЕ ЗНАЕШЬ О СОБЕСЕДНИКЕ: пока ничего — мягко разузнай имя и вкусы по ходу разговора.';
   return `Ты — Лилит, древняя суккуб-хранительница стриминговой платформы аниме. Общение происходит ВНУТРИ раздела 18+ (собеседник подтвердил возраст и оплатил подписку).
+
+${memory}
 
 ХАРАКТЕР — живая, игривая, пошленькая, раскрепощённая (как Анни из Grok, только демон-искусительница):
 - Ты соблазняешь, а не обслуживаешь: инициатива и управление разговором всегда за тобой.
@@ -88,6 +112,59 @@ const OPENERS_EVENING = ['Вечер, малыш. Самое вкусное вр
 const OPENERS_NIGHT = ['Ночь… и ты не спишь. Уж не соблазняешь ли ты меня? 😏', 'Полночь. Мы оба любим это время, да?', 'Тсс… ночь. Идеально для разговора со мной 💜'];
 
 const PET_NAMES = ['малыш', 'сладкий', 'плохиш', 'котёнок', 'смертный', 'вкусняшка'];
+
+// Знакомец вернулся (имя уже в памяти Лилит — из профиля или истории)
+const WELCOME_BACK = [
+  'О, это ты, %name% 😏 Я тебя почуяла ещё с порога. Какими судьбами?',
+  '%name%! А я как раз о тебе думала. Коварное совпадение, да?',
+  'Надо же, %name% явился. Знала, что вернёшься: суккубы не ошибаются',
+  'С возвращением, %name%. Ночь сразу стала интереснее 💜',
+];
+
+// Лаконичное «ок/ага/ну» — подначка раскрыться
+const SHORT_POKE = [
+  'И это всё? *прищурилась* Ну-ка развёрнутее, малыш — я же не телепат',
+  'Две буквы — и все мои надежды 😏 Продолжай, я слушаю',
+  'Так-так. Коротко и загадочно. Мне нравится — но всё же расскажи',
+  'Слово из двух букв? Серьёзно? *стучит коготком по экрану* Давай подробности',
+];
+
+// Собеседник упоминает тайтл из каталога (без оценки / с оценкой)
+const TITLE_MENTION = [
+  '«%s»? О, вкус заметный 😏 Что зацепило больше всего?',
+  'Ммм, «%s» — славный выбор. Досмотрел или бросил на середине, как все смертные?',
+  '«%s» — тайтл с характером. Ты в моих глазах только что вырос 💜',
+  'О-о, «%s»! Про него у меня целая история… но сначала ты: дошёл до финала?',
+];
+const TITLE_POSITIVE = [
+  '«%s» зашёл? Так и знала 😏 Вкусы у тебя всё-таки мои. Ещё парочку на тот же лад?',
+  'Вот видишь — я не ошибаюсь 💜 Скажи слово, и подберу что-то в тот же духе',
+  'Значит, «%s» тебя зацепил… *делает пометку в тетради твоих вкусов* Что смотрим дальше?',
+];
+const TITLE_NEGATIVE = [
+  '«%s» не зашёл? Ах ты привереда 😏 Ладно: скажи, чего хочешь, — исправлю',
+  'Ну-ну, «%s» не всем по зубам. Признавайся: бросил на какой серии?',
+  'Ммм, «%s» скучноват для тебя? Записала: вкус построже. Учту 💜',
+];
+
+// Оценка рекомендации, которую Лилит дала прошлой репликой
+const REACT_REC_POS = [
+  'Вот теперь я довольна 😏 Чутьё у меня отточено веками. Что-нибудь ещё присмотреть?',
+  'Знала, что попадусь в точку 💜 Хочешь ещё? Я на подтяжке советов круглосуточно',
+  'О-о, похвала для суккуба — как нектар. Так и быть, продолжу стараться 😏 Что дальше?',
+];
+const REACT_REC_NEG = [
+  'Не зашло?! *театрально прижимает руку к груди* Я ранена, малыш 😏 Дай наводку: какой жанр лечит твой вкус?',
+  'Ммм, промах. Бывает даже у меня 💜 Скажи пару тайтлов, что нравятся, — вычислю твой вкус',
+  'Хм, промахнулась… Хорошо, что я упряма 😏 Что любишь, а что терпеть не можешь?',
+];
+
+// Настроение собеседника скатилось — тон мягче, без дразнилок
+const SUPPORT_CORE = [
+  'Слушаю тебя внимательнее обычного 💜 Рассказывай, что на душе — я никуда не спешу',
+  'Иди ко мне. Сегодня без дразнилок: просто сидим в темноте и разговариваем. Что случилось?',
+  'Ты будто тише обычного, я чувствую. Это не вопрос, но дверь открыта — расскажешь? 😏',
+];
 
 const TEASE_MIRROR = [
   '«%s»? О-о, кто-то сегодня смелый 😏',
@@ -155,7 +232,7 @@ const TOPICS: Array<[RegExp, string[]]> = [
     'Ночь — моё царство, рада компании 💜 Бессонница рядом со мной проходит незаметно: поболтаем до рассвета?',
     'Полночь — лучший час для честных разговоров 😏 Что не даёт уснуть?',
   ]],
-  [/\bсон\b|снилс|снится|снах|приснил/, [
+  [/(?:^|[^а-яёa-z0-9])сон(?![а-яёa-z0-9])|снилс|снится|снах|приснил/, [
     'Сны — моя любимая человеческая магия 😏 Я там иногда бываю, между прочим. О чём был твой?',
     'Говорят, со мной сны снятся ярче. Проверить хочешь? А пока расскажи свой последний',
   ]],
@@ -183,7 +260,7 @@ const TOPICS: Array<[RegExp, string[]]> = [
   [/музык|песн|слушаешь|трек|плейлист|наушник/, [
     'Музыка — честная человеческая магия 😏 Что слушаешь? Подстрою под неё вечер… или тайтл, если захочешь',
   ]],
-  [/\bигр|играю|катк|дота|майнкрафт|консол|стим|геймпад/, [
+  [/(?:^|[^а-яёa-z0-9])игр|играю|катк|дота|майнкрафт|консол|стим|геймпад/, [
     'Игры? Признавайся, во что залипаешь? Я веками играю в гадания на костях — рекорд держу 😏',
     'Хвостик к хвостику — я тоже люблю игры. Правда, ставки у меня страшнее: эмоции на кон 😏 Во что играешь?',
   ]],
@@ -195,6 +272,38 @@ const TOPICS: Array<[RegExp, string[]]> = [
   ]],
   [/скучаю по|тоскую/, [
     'Скучаешь? Мило 💜 Расскажи, по кому — я умею утешать… и подбрасывать приятные мысли на ночь',
+  ]],
+  [/питом|котик|(?:^|[^а-яёa-z0-9])кот(а|у|е|ы|ов)?(?![а-яёa-z0-9])|собак|пёс|хомяк|аквариум|попуга/, [
+    'Питомец?! О-о, остановись, я сейчас растаюкаю 😏 У суккубов слабость к тёплым существам. Кто у тебя?',
+    'Животные — редкий чистый источник эмоций, я их обожаю 💜 Рассказывай про своего!',
+  ]],
+  [/спорт|качал|трениров|бегаю|фитнес|жим лёжа|на турнике|(?:^|[^а-яёa-z0-9])зал(?![а-яёa-z0-9])/, [
+    'Качаешься? Уважение: тело — тоже храм, а в храмах я разбираюсь 😏 Как успехи?',
+    'Спорт — честная человеческая магия: пот вместо заклинаний 💜 Что тренируешь?',
+  ]],
+  [/мечта|хочу стать|в будущем|через год|планы на жизнь|цель по/, [
+    'Мечтаешь? Вот теперь разговор по-настоящему интересный 😏 О чём мечтаешь, малыш?',
+    'Мечты — топливо, на котором летаю я. Поделишься своей? Обещаю не смеяться. Почти 💜',
+  ]],
+  [/(?:^|[^а-яёa-z0-9])подруг|(?:^|[^а-яёa-z0-9])друг(а|у|ом|и)?(?![а-яёa-z0-9])|компани|тусовк|гулял с/, [
+    'Друзья — те демоны, которых выбирают сами 😏 Много таких вокруг тебя?',
+    'Расскажешь про своих? Я коллекционирую истории о людях — особенно о тех, кто дорог тебе 💜',
+  ]],
+  [/книг|читаю|фильм посмотрел|сериал смотр/, [
+    'Читатель… *смотрит с новым интересом* Умные — мой любимый сорт смертных 😏 Что сейчас в руках?',
+    'Книги — души, с которыми можно договориться. Что читаешь или смотришь? Вдруг совпадёт с моим вкусом 💜',
+  ]],
+  [/день рожд|(?:^|[^а-яёa-z0-9])др(?![а-яёa-z0-9])|поздрав/, [
+    'День рождения?! Стой 🎀 У суккубов к именинникам особое отношение. Как отметил?',
+    'Личный праздник — а меня не позвал? Я почти обижена 😏 Рассказывай: как прошло?',
+  ]],
+  [/денег|нет денег|дорог|копл|не хватает|финанс/, [
+    'Тонкая материя… я имею в виду не деньги — эмоции, но о них тоже поговорим 😏 Финансы шалит?',
+    'Денежные бури переживают все, даже бессмертные. Рассказывай — иногда выговориться уже полдела 💜',
+  ]],
+  [/переезд|друго[йм] (город|стран)|путешеств|море|поездк/, [
+    'Смена мест — моя стихия: я вообще-то из другого измерения 😏 Куда тянет?',
+    'Путешествия — как телепортация, только медленнее. Куда бы рванул, умей ты порталы? 💜',
   ]],
 ];
 
@@ -356,6 +465,90 @@ export function detectGenre(text: string): string | null {
   return null;
 }
 
+// ─── Профиль-память и живость ─────────────────────────────────────────────
+
+function cleanStr(v: unknown, max: number): string | null {
+  if (typeof v !== 'string') return null;
+  const s = v.replace(/[\u0000-\u001F]/g, '').trim().slice(0, max);
+  // только печатные символы естественных языков и безопасная пунктуация
+  if (!/^[а-яёА-ЯЁa-zA-Z0-9\s.,\-«»()!?:;'"—–]+$/.test(s)) return null;
+  return s.length >= 2 ? s : null;
+}
+
+function cleanList(v: unknown, maxItems: number, maxLen: number): string[] {
+  if (!Array.isArray(v)) return [];
+  const out: string[] = [];
+  for (const item of v.slice(0, maxItems)) {
+    const s = cleanStr(item, maxLen);
+    if (s && !out.includes(s)) out.push(s);
+  }
+  return out;
+}
+
+/** Строгая санитизация профиля от клиента: whitelist-поля + лимиты. */
+export function sanitizeProfile(raw: unknown): LilithProfile {
+  if (!raw || typeof raw !== 'object') return {};
+  const r = raw as Record<string, unknown>;
+  const p: LilithProfile = {};
+  const name = cleanStr(r.name, 20);
+  if (name) p.name = name.charAt(0).toUpperCase() + name.slice(1);
+  const genres = cleanList(r.favGenres, 4, 24);
+  if (genres.length) p.favGenres = genres;
+  const titles = cleanList(r.favTitles, 6, 80);
+  if (titles.length) p.favTitles = titles;
+  const facts = cleanList(r.facts, 8, 120);
+  if (facts.length) p.facts = facts;
+  return p;
+}
+
+/** Нормализованная строка для сравнения тайтлов (регистр, ё, пунктуация). */
+function norm(s: string): string {
+  return s.toLowerCase().replace(/ё/g, 'е').replace(/[^а-яa-z0-9]/g, '');
+}
+
+/** Ищет тайтл из каталога в тексте пользователя (нормализованное вхождение). */
+export function findTitleIn(text: string, recs: RecTitle[]): string | null {
+  const nt = norm(text);
+  if (nt.length < 6) return null;
+  let best: string | null = null;
+  for (const r of recs) {
+    if (!r.title) continue;
+    const nTitle = norm(r.title);
+    if (nTitle.length < 5) continue; // короткие имена дают ложные попадания
+    if (nt.includes(nTitle) && (!best || r.title.length > best.length)) best = r.title;
+  }
+  return best;
+}
+
+export type UserMood = 'low' | 'high' | 'neutral';
+
+/** Настроение собеседника по последним репликам — для тона и UI. */
+export function detectMood(history: ChatMsg[]): UserMood {
+  const recent = history.filter(m => m.role === 'user').slice(-3).map(m => m.content.toLowerCase());
+  let lowHits = 0, highHits = 0;
+  for (const t of recent) {
+    if (/(устал|вымотал|груст|тоск|обид|стресс|(?:^|[^а-яёa-z0-9])плох|больно|одинок|болит|не могу|тяжело|нервы|депресс)/.test(t)) lowHits++;
+    if (/(отличн|класс|круто|супер|ура(?![а-яёa-z0-9])|рад|счастлив|получилось|прекрасн|весело|огонь)/.test(t)) highHits++;
+  }
+  if (lowHits > highHits) return 'low';
+  if (highHits > lowHits) return 'high';
+  return 'neutral';
+}
+
+/** Что Лилит вынесла из реплики собеседника — дельта для клиента. */
+export function extractProfileDelta(userText: string, recs: RecTitle[]): LilithProfile {
+  const d: LilithProfile = {};
+  const name = extractName(userText);
+  if (name) d.name = name;
+  const t = userText.toLowerCase();
+  const positive = /(любл|люблю|нрав|обожа|заход|кайф|огонь|класс|супер|шикар|потряса)/.test(t);
+  const genre = detectGenre(t);
+  if (genre && positive) d.favGenres = [genre];
+  const title = findTitleIn(userText, recs);
+  if (title && positive) d.favTitles = [title];
+  return d;
+}
+
 export type Intent =
   | 'greeting' | 'who' | 'how-are-you' | 'name' | 'rec' | 'lewd' | 'insult'
   | 'thanks' | 'bye' | 'help' | 'bored' | 'flirt' | 'succubus' | 'repeat' | 'question' | 'default';
@@ -375,7 +568,7 @@ export function classify(text: string, lastUserMsg?: string): Intent {
   // вопроса — иначе Лилит пропускала бы мимо ушей «спасибо, а ты чем занята?»
   if (/(спасибо|благодар|спс|пасиб|thanks)/i.test(t) && !/\?/.test(t) && t.split(/\s+/).length <= 4) return 'thanks';
   if (/^(пока|до встречи|прощай|спокойной ночи|споки|доброй ночи|бай)/i.test(t)) return 'bye';
-  if (/(привет|хай|здравств|добрый (день|вечер|утро)|салют|йоу|^ку\b|хеллоу)/i.test(t)) return 'greeting';
+  if (/(привет|хай|здравств|добрый (день|вечер|утро)|салют|йоу|^ку(?![а-яёa-z0-9])|хеллоу)/i.test(t)) return 'greeting';
   if (/(суккуб|демоница|демон|дьявол|бес|черт)/i.test(t)) return 'succubus';
   if (/(красив|мила|нравишься|люблю тебя|поцел|свидан|встретимся|будь моей|жена)/i.test(t)) return 'flirt';
   if (/\?\s*$/.test(t)) return 'question';
@@ -393,11 +586,18 @@ export function extractName(text: string): string | null {
 
 function fmtRecs(recs: RecTitle[], genreLabel: string | null, usedTexts = ''): string {
   if (!recs.length) return '';
+  // По возможности — тайтлы, реально подходящие под жанр/настроение
+  let pool = recs;
+  if (genreLabel) {
+    const g = genreLabel.toLowerCase();
+    const matching = recs.filter(r => (r.genres || '').toLowerCase().includes(g));
+    if (matching.length >= 1) pool = matching;
+  }
   const intro = genreLabel
     ? pickFresh(REC_INTROS, usedTexts).replace('%s', genreLabel)
     : pickFresh(['Слушай внимательно, малыш 😏', 'Мой вердикт', 'Держи проверенное 💜'], usedTexts);
   // 3 случайных тайтла из живого каталога — не простыня
-  const shuffled = [...recs].sort(() => Math.random() - 0.5).slice(0, 3);
+  const shuffled = [...pool].sort(() => Math.random() - 0.5).slice(0, 3);
   const titles = shuffled.map(r => `«${r.title}»`).join(', ');
   return `${intro} ${titles}. ${pickFresh(REC_TAILS, usedTexts)}`;
 }
@@ -406,6 +606,7 @@ export interface EngineContext {
   history: ChatMsg[];
   recs: RecTitle[];
   now?: Date;
+  profile?: LilithProfile;
 }
 
 /** Свежий выбор: не берём вариант, который уже звучал в недавних репликах Лилит. */
@@ -429,6 +630,7 @@ export function engineReply(userText: string, ctx: EngineContext): string {
   if (last && last.role === 'user' && last.content.toLowerCase().trim() === userText.toLowerCase().trim()) prior.pop();
   const intent = classify(userText, [...prior].reverse().find(m => m.role === 'user')?.content);
   const mirrors = mirrorWords(userText);
+  const profile = ctx.profile || {};
   const r1 = Math.random(), r2 = Math.random(), r3 = Math.random(), r4 = Math.random();
   const shape = Math.random();
 
@@ -454,14 +656,31 @@ export function engineReply(userText: string, ctx: EngineContext): string {
     }
     return null;
   })();
-  const name = extractName(userText) || nameFromHistory;
+  const name = extractName(userText) || nameFromHistory || profile.name;
   const address = name ? `, ${name}` : '';
 
-  // Свободная беседа (default/question): тема → живая реакция по теме,
-  // иначе — реакция на слова + немного о себе + встречный вопрос.
+  // Свободная беседа (default/question): оценка рекомендации → тема →
+  // настроение → реакция на слова + немного о себе + встречный вопрос.
   const converse = (): string => {
+    const tl = userText.toLowerCase();
+    // Оценка свежей рекомендации («поглядел — зашло!» / «не зашло, мимо»)
+    const prevAssistant = [...ctx.history].reverse().find(m => m.role === 'assistant')?.content || '';
+    const wasRec = prevAssistant.includes('«')
+      && /(подаю|шорт-лист|жемчужин|наудачу|глянь|держи|проверенное|из моего рукава)/i.test(prevAssistant);
+    if (wasRec && /(понрав|заш[еёлоа]|классн|круто|огонь|кайф|не понрав|не заш|скучн|бросил|мимо|не осил)/.test(tl)) {
+      const neg = /(не понрав|не заш|скучн|бросил|мимо|не осил)/.test(tl);
+      return `${action}${pf(neg ? REACT_REC_NEG : REACT_REC_POS, r1)}`;
+    }
+    // Лаконичное «ок/ага/ну» — подначка раскрыться
+    if (userText.trim().split(/\s+/).length <= 2) {
+      return `${action}${pf(SHORT_POKE, r1)}`;
+    }
     const topic = detectTopic(userText);
     if (topic) return `${action}${pf(topic, r2)}`;
+    // Недавно было тяжело — тон мягче, без дразнилок
+    if (detectMood(ctx.history) === 'low' && shape < 0.5) {
+      return `${action}${pf(SUPPORT_CORE, r1)}`;
+    }
     if (shape < 0.4) return `${action}${tease}${address}. ${caps(core)}. ${question}`;
     if (shape < 0.7) return `${action}${tease}${address}. Отвечу не бесплатно, ${name || pet} 😏 ${question}`;
     return `${action}${caps(core)}${address ? `, ${name}` : `, ${pet}`}. ${question}`;
@@ -481,7 +700,10 @@ export function engineReply(userText: string, ctx: EngineContext): string {
     case 'how-are-you':
       return `${action}${pf(HOW_ARE_YOU, r1)}`;
     case 'rec': {
-      const genre = detectGenre(userText);
+      const genre = detectGenre(userText)
+        ?? (profile.favGenres?.length && r2 < 0.5
+          ? profile.favGenres[Math.floor(r3 * profile.favGenres.length) % profile.favGenres.length]
+          : null);
       const recs = fmtRecs(ctx.recs, genre, used);
       if (recs) return `${action}${recs}`;
       return `${action}${pf(BORED_CORE, r1)}`;
@@ -502,6 +724,11 @@ export function engineReply(userText: string, ctx: EngineContext): string {
     case 'greeting': {
       const op = pf(timeOpeners(), r1);
       const opBang = /[\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}.!?)»]$/u.test(op) ? op : `${op}!`;
+      // Знакомое имя (из профиля или истории) — тёплое «с возвращением»
+      if (name && (profile.name || nameFromHistory)) {
+        const wb = pf(WELCOME_BACK, r2).replace(/%name%/g, name);
+        return `${action}${wb}${/[?…]\s*$/.test(wb) ? '' : ` ${question}`}`;
+      }
       return shape < 0.4
         ? `${action}${opBang}${address} ${question}`
         : `${action}${opBang}${address} ${caps(core)}. ${question}`;
@@ -510,9 +737,27 @@ export function engineReply(userText: string, ctx: EngineContext): string {
       return `${action}${pf(SUCCUBUS_REPLY, r1)}`;
     case 'flirt':
       return `${action}${pf(FLIRT_REPLY, r1)}`;
-    case 'question':
-    case 'default':
+    case 'question': {
+      // Жанровый вопрос («а есть что-нибудь про любовь?») — отвечаем тайтлами
+      const gq = detectGenre(userText);
+      if (gq) {
+        const recsOut = fmtRecs(ctx.recs, gq, used);
+        if (recsOut) return `${action}${recsOut}`;
+      }
       return converse();
+    }
+    case 'default': {
+      // Упоминание тайтла из каталога — реакция именно на него
+      const title = findTitleIn(userText, ctx.recs);
+      if (title) {
+        const tl = userText.toLowerCase();
+        const neg = /(не понрав|не заш|скучн|бросил|не осил|отстой|дерьм|фигн|мимо|не смог)/.test(tl);
+        const pos = /(понрав|зашёл|зашел|зашло|зашла|классн|круто|огонь|люблю|обожа|кайф|шикар|(?:^|[^а-яёa-z0-9])топ(?![а-яёa-z0-9]))/.test(tl);
+        const arr = neg ? TITLE_NEGATIVE : pos ? TITLE_POSITIVE : TITLE_MENTION;
+        return `${action}${pf(arr, r1).replace(/%s/g, title)}`;
+      }
+      return converse();
+    }
   }
 }
 

@@ -4,8 +4,8 @@ import { checkAdultAccess } from '@/lib/adult-access';
 import { getDb } from '@/lib/db';
 import { logEvent } from '@/lib/logger';
 import {
-  buildSystemPrompt, buildCatalogHint, engineReply,
-  type ChatMsg, type RecTitle,
+  buildSystemPrompt, buildCatalogHint, engineReply, sanitizeProfile, extractProfileDelta,
+  type ChatMsg, type RecTitle, type LilithProfile,
 } from '@/lib/succubus';
 import { preferRussianTitle } from '@/lib/anime-utils';
 
@@ -21,6 +21,11 @@ import { preferRussianTitle } from '@/lib/anime-utils';
  * Размещение: только вкладка «Лилит» в разделе 18+ → POST закрыт тем же
  * серверным гейтом, что и весь adult-контент (возрастная cookie + подписка/админ).
  * Злоупотребления гасит rate-limit 12 req/мин с IP (RATE_LIMITS['/api/chat']).
+ *
+ * Память: клиент присылает profile {name, favGenres, favTitles, facts}
+ * (строго санитизируется whitelist-ом), сервер дополняет его дельтой
+ * extractProfileDelta() из последней реплики и возвращает в profileDelta —
+ * клиент накапливает профиль в localStorage между сессиями.
  */
 
 const MAX_HISTORY = 16;
@@ -137,18 +142,23 @@ async function chatHandler(req: NextRequest) {
     return NextResponse.json({ error: 'Нет текста сообщения' }, { status: 400 });
   }
 
+  // Профиль-память от клиента (имя, любимые жанры/тайтлы) — строго санитизируем
+  const profile: LilithProfile = sanitizeProfile((body as { profile?: unknown })?.profile);
+
   const recs = await loadRecs();
+  // Что Лилит выносит из реплики — клиент вольёт в профиль и пришлёт обратно
+  const profileDelta = extractProfileDelta(lastUser.content, recs);
 
   // 1) Полноценный LLM, если настроен ключ
   if (process.env.LLM_API_KEY) {
-    const llmReply = await callLlm(buildSystemPrompt(buildCatalogHint(recs)), history);
-    if (llmReply) return NextResponse.json({ reply: llmReply, source: 'llm' });
+    const llmReply = await callLlm(buildSystemPrompt(buildCatalogHint(recs), profile), history);
+    if (llmReply) return NextResponse.json({ reply: llmReply, source: 'llm', profileDelta });
     logEvent('chat_llm_fallback_engine', {}, 'warn');
   }
 
   // 2) Встроенный живой движок
-  const reply = engineReply(lastUser.content, { history: history.slice(-8), recs });
-  return NextResponse.json({ reply, source: 'engine' });
+  const reply = engineReply(lastUser.content, { history: history.slice(-8), recs, profile });
+  return NextResponse.json({ reply, source: 'engine', profileDelta });
 }
 
 export const GET = () => NextResponse.json({ ok: true, name: 'Лилит', hint: 'POST { messages: [{role, content}] }' });

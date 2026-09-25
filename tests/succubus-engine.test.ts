@@ -1,6 +1,10 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { classify, extractName, engineReply, detectGenre, mirrorWords, type ChatMsg } from '../src/lib/succubus';
+import {
+  classify, extractName, engineReply, detectGenre, mirrorWords,
+  sanitizeProfile, extractProfileDelta, detectMood,
+  type ChatMsg,
+} from '../src/lib/succubus';
 
 const RECS = [
   { title: 'Ван-Пис', genres: 'приключения, фэнтези' },
@@ -123,4 +127,84 @@ test('engineReply: свободная тема (усталость) получа
   const r = engineReply('я так устал на работе сегодня', { history: [], recs: RECS });
   assert.ok(!r.includes('«'), `не должно быть списка тайтлов: ${r}`);
   assert.match(r, /устал|день|слушаю|отвлек|ноч|расскаж|дедлайн|работ|сил/i, `нет живой реакции: ${r}`);
+});
+
+// ─── Доработка общения: профиль-память, тайтлы, живость ──────────────────
+
+test('sanitizeProfile: whitelist-очистка, лимиты и капитализация имени', () => {
+  const p = sanitizeProfile({
+    name: 'артём',
+    favGenres: ['романтика', '<script>alert(1)</script>', ''],
+    favTitles: ['Твоё имя'],
+    facts: ['работает ночью'],
+    hack: 'x',
+  });
+  assert.equal(p.name, 'Артём');
+  assert.deepEqual(p.favGenres, ['романтика']);
+  assert.deepEqual(p.favTitles, ['Твоё имя']);
+  assert.deepEqual(p.facts, ['работает ночью']);
+  assert.equal((p as Record<string, unknown>).hack, undefined);
+  assert.deepEqual(sanitizeProfile(null), {});
+  assert.deepEqual(sanitizeProfile('oops'), {});
+  assert.deepEqual(sanitizeProfile(42), {});
+});
+
+test('engineReply: помнит имя из профиля даже без истории', () => {
+  const r = engineReply('привет', { history: [], recs: RECS, profile: { name: 'Артём' } });
+  assert.ok(r.includes('Артём'), `имя из профиля: ${r}`);
+});
+
+test('engineReply: реакция на упоминание тайтла из каталога', () => {
+  const r = engineReply('смотрел Ван-Пис на выходных', { history: [], recs: RECS });
+  assert.ok(r.includes('Ван-Пис'), `тайтл в ответе: ${r}`);
+});
+
+test('engineReply: негатив про тайтл — дразнящий ответ без обиды', () => {
+  const r = engineReply('Ван-Пис скучный, бросил', { history: [], recs: RECS });
+  assert.ok(r.includes('Ван-Пис'), `тайтл в ответе: ${r}`);
+  assert.match(r, /приверед|по зубам|записала|сери|исправлю/i, `нет дразнилки: ${r}`);
+});
+
+test('engineReply: короткое «ок» получает подначку раскрыться', () => {
+  const r = engineReply('ок', { history: [], recs: RECS });
+  assert.match(r, /развёрнут|подробн|продолжай|расскаж|телепат/i, `подначка: ${r}`);
+});
+
+test('engineReply: оценка рекомендации — живая реакция, а не новый список', () => {
+  const history: ChatMsg[] = [
+    { role: 'user', content: 'посоветуй аниме' },
+    { role: 'assistant', content: 'Мой вердикт «Твоё имя», «Тетрадь смерти». Глянь трейлер. Не зайдёт — вернись' },
+    { role: 'user', content: 'глянул, зашло!' },
+  ];
+  const r = engineReply('глянул, зашло!', { history, recs: RECS });
+  assert.ok(!r.includes('«'), `не должен снова вываливать список: ${r}`);
+  assert.match(r, /😏|💜/, `нет живости в реакции: ${r}`);
+});
+
+test('engineReply: жанровый вопрос («про любовь?») — ответ тайтлами', () => {
+  const r = engineReply('а есть что-нибудь про любовь?', { history: [], recs: RECS });
+  assert.ok(RECS.some(t => r.includes(`«${t.title}»`)), `тайтл в ответе: ${r}`);
+});
+
+test('engineReply: профиль — любимый жанр не ломает рекомендацию', () => {
+  const r = engineReply('посоветуй аниме', { history: [], recs: RECS, profile: { favGenres: ['романтика'] } });
+  assert.ok(RECS.some(t => r.includes(`«${t.title}»`)), `тайтл в ответе: ${r}`);
+});
+
+test('extractProfileDelta: имя, жанр и тайтл при позитиве', () => {
+  const d = extractProfileDelta('меня зовут Артём, люблю романтику и Ван-Пис обожаю', RECS);
+  assert.equal(d.name, 'Артём');
+  assert.deepEqual(d.favGenres, ['романтика']);
+  assert.deepEqual(d.favTitles, ['Ван-Пис']);
+});
+
+test('extractProfileDelta: без позитива жанр не запоминается', () => {
+  const d = extractProfileDelta('ненавижу романтику в аниме', RECS);
+  assert.equal(d.favGenres, undefined);
+});
+
+test('detectMood: усталость, радость и нейтраль', () => {
+  assert.equal(detectMood([{ role: 'user', content: 'я так устал' }]), 'low');
+  assert.equal(detectMood([{ role: 'user', content: 'получилось! ура!' }]), 'high');
+  assert.equal(detectMood([]), 'neutral');
 });
