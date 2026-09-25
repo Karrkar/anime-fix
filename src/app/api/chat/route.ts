@@ -97,8 +97,11 @@ async function callLlm(system: string, history: ChatMsg[]): Promise<string | nul
   const buildBody = (withPenalty: boolean) => JSON.stringify({
     model,
     messages: [{ role: 'system', content: system }, ...history],
-    max_tokens: 360,
+    max_tokens: 720,
     temperature: 0.95,
+    // gpt-oss-модели «думают» токенами из общего лимита — без low-режима
+    // реплики обрезаются на полуслове; параметр понимают Groq/OpenAI o-серии
+    ...(model.includes('gpt-oss') ? { reasoning_effort: 'low' } : {}),
     ...(withPenalty ? { presence_penalty: 0.6 } : {}), // живее: меньше склонность повторяться
   });
   try {
