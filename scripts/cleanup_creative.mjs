@@ -15,7 +15,8 @@
  *          node scripts/cleanup_creative.mjs         (боевой прогон)
  */
 const SB = 'https://uymeyfnuxfbkwisggzdt.supabase.co';
-const SK = process.env.SUPABASE_SERVICE_ROLE_KEY || 'REDACTED-ROTATE-KEY-IN-SUPABASE';
+const SK = process.env.SUPABASE_SERVICE_ROLE_KEY;
+if (!SK) { console.error('SUPABASE_SERVICE_ROLE_KEY не задан — экспортируйте переменную окружения'); process.exit(1); }
 const DRY = process.argv.includes('--dry');
 
 const KEEP_CHANNELS = ['pornofullp','art_Hub_ai','neuroart1215','neyroanime','stefanfalkokmoth','simple_elf','the_horny_ai','genshin3416'];

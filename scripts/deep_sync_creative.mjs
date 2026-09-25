@@ -12,7 +12,8 @@
 import sharp from 'sharp';
 
 const SB = 'https://uymeyfnuxfbkwisggzdt.supabase.co';
-const SK = 'REDACTED-ROTATE-KEY-IN-SUPABASE';
+const SK = process.env.SUPABASE_SERVICE_ROLE_KEY;
+if (!SK) { console.error('SUPABASE_SERVICE_ROLE_KEY не задан — экспортируйте переменную окружения'); process.exit(1); }
 
 const DEPTH_CAP = 600;
 const MIRROR_MAX_PHOTOS = 9;
