@@ -61,7 +61,8 @@ async function llmCheckHandler(_req: NextRequest) {
       body: JSON.stringify({
         model,
         messages: [{ role: 'user', content: 'Ответь одним словом: пинг' }],
-        max_tokens: 10,
+        max_tokens: 64, // gpt-oss тратит часть лимита на рассуждения — 10 мало
+        ...(model.includes('gpt-oss') ? { reasoning_effort: 'low' } : {}),
       }),
       signal: c2.signal,
     });
