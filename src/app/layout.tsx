@@ -32,15 +32,16 @@ export const metadata: Metadata = {
     statusBarStyle: "black-translucent",
   },
   icons: {
-    // Раньше /favicon.ico отдавал 404 → в закладках/встроенных браузерах
-    // рядом со ссылкой не было жёлтой AP-иконки. Возвращаем: ico для
-    // прямых запросов + PNG для остальных размеров.
+    // Раньше /favicon.ico отдавал 404 → рядом со ссылкой не было жёлтой
+    // AP-иконки. Браузеры кэшируют favicon очень агрессивно (Ctrl+F5 его НЕ
+    // обновляет) → подключаем с версионным суффиксом ?v=ap3: новый URL
+    // заставляет вкладку/закладки/превью перезагрузить иконку.
     icon: [
-      { url: "/favicon.ico", sizes: "48x48" },
-      { url: "/icons/icon-192.png", sizes: "192x192", type: "image/png" },
+      { url: "/favicon.ico?v=ap3", sizes: "48x48" },
+      { url: "/icons/icon-192.png?v=ap3", sizes: "192x192", type: "image/png" },
     ],
-    shortcut: "/favicon.ico",
-    apple: "/icons/apple-touch-icon.png",
+    shortcut: "/favicon.ico?v=ap3",
+    apple: "/icons/apple-touch-icon.png?v=ap3",
   },
   openGraph: {
     type: "website",
@@ -49,13 +50,13 @@ export const metadata: Metadata = {
     url: SITE_URL,
     title: "AnimePlatform — смотреть аниме онлайн бесплатно",
     description: "Тысячи аниме тайтлов, свежие серии и лучшие арты — всё в одном месте.",
-    images: [{ url: "/icons/icon-512.png", width: 512, height: 512, alt: "AnimePlatform" }],
+    images: [{ url: "/icons/icon-512.png?v=ap3", width: 512, height: 512, alt: "AnimePlatform" }],
   },
   twitter: {
     card: "summary_large_image",
     title: "AnimePlatform — смотреть аниме онлайн бесплатно",
     description: "Тысячи аниме тайтлов, свежие серии и лучшие арты — всё в одном месте.",
-    images: ["/icons/icon-512.png"],
+    images: ["/icons/icon-512.png?v=ap3"],
   },
 };
 
