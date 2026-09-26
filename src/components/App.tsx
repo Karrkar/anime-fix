@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { Clock, User } from 'lucide-react';
 import { HentaiPage } from '@/components/adult/HentaiPage';
@@ -17,6 +17,32 @@ import { WatchPage } from '@/components/pages/WatchPage';
 import { Anime, FavUpdate, Page } from '@/lib/client-types';
 import { apiFetch, authHeaders, computeFavUpdates, readFavSnapshot, writeFavSnapshot } from '@/lib/client-utils';
 
+// Hash-роутинг разделов: /#catalog, /#search, /#favorites, /#history, /#profile, /#hentai —
+// прямые ссылки (шаринг/закладки/F5 остаются в разделе) + рабочая кнопка «Назад» браузера.
+// Плеер остаётся на deep-link /?open={id} (кнопки SEO-страниц), URL в плеере не меняем.
+const HASH_PAGES: Partial<Record<string, Page>> = {
+  '': 'home',
+  '#home': 'home',
+  '#catalog': 'catalog',
+  '#search': 'search',
+  '#favorites': 'favorites',
+  '#history': 'history',
+  '#profile': 'profile',
+  '#hentai': 'hentai',
+  '#admin': 'admin',
+};
+
+function pageFromHash(): Page | null {
+  try {
+    const h = decodeURIComponent(window.location.hash).trim().toLowerCase();
+    return HASH_PAGES[h] ?? null;
+  } catch { return null; }
+}
+
+function urlForPage(p: Page): string {
+  return p === 'home' ? '/' : `/#${p}`;
+}
+
 export default function App() {
   const [page, setPage] = useState<Page>('home');
   const [watchId, setWatchId] = useState<string | null>(null);
@@ -26,6 +52,10 @@ export default function App() {
   const [prevPage, setPrevPage] = useState<Page>('home');
   const [moreMenuOpen, setMoreMenuOpen] = useState(false);
   const [hasSubscription, setHasSubscription] = useState(false);
+  // Инициализацию роута (чтение URL) выполняем один раз: в dev StrictMode эффект
+  // запускается дважды, а replaceState('/') после /?open= вычищает параметр —
+  // без флага второй прогон счёл бы hash пустым и сбросил плеер на главную.
+  const routeInitDone = useRef(false);
 
   // Load favorites on mount (+ считаем «обновления в избранном»)
   useEffect(() => {
@@ -93,23 +123,51 @@ export default function App() {
   }, []);
 
   // Deep-link из SEO-страниц: /?open={id} открывает плеер (URL чистим,
-  // чтобы F5 не возвращал в плеер — back из плеера ведёт на главную)
+  // чтобы F5 не возвращал в плеер — back из плеера ведёт на главную).
+  // Плюс стартовый раздел из hash: /#catalog и т.п. открываются сразу.
   useEffect(() => {
-    try {
-      const o = new URLSearchParams(window.location.search).get('open');
-      if (o && /^[a-zA-Z0-9-]{1,40}$/.test(o)) {
-        setWatchId(o);
-        setWatchEp(1);
-        setPage('watch');
-        window.history.replaceState(null, '', '/');
+    if (!routeInitDone.current) {
+      routeInitDone.current = true;
+      let deepLinked = false;
+      try {
+        const o = new URLSearchParams(window.location.search).get('open');
+        if (o && /^[a-zA-Z0-9-]{1,40}$/.test(o)) {
+          setWatchId(o);
+          setWatchEp(1);
+          setPage('watch');
+          window.history.replaceState(null, '', '/');
+          deepLinked = true;
+        }
+      } catch { /* ignore */ }
+      if (!deepLinked) {
+        const p = pageFromHash();
+        if (p) setPage(p);
       }
-    } catch { /* ignore */ }
+    }
+    // «Назад/Вперёд» браузера — тоже переключают раздел (hashchange)
+    const onHashChange = () => {
+      const p = pageFromHash();
+      if (p) {
+        setPage(p);
+        setWatchId(null);
+        setMoreMenuOpen(false);
+      }
+    };
+    window.addEventListener('hashchange', onHashChange);
+    return () => window.removeEventListener('hashchange', onHashChange);
   }, []);
 
   const navigate = useCallback((p: Page) => {
     setPage(p);
     setWatchId(null);
     setMoreMenuOpen(false);
+    // Синхронизируем URL: у раздела появляется прямая ссылка (F5 остаётся в разделе).
+    // pushState не триггерит hashchange — состояние не переключается дважды.
+    try {
+      if (window.location.pathname + window.location.hash !== urlForPage(p)) {
+        window.history.pushState(null, '', urlForPage(p));
+      }
+    } catch { /* ignore */ }
   }, []);
 
   const toggleFav = useCallback(async (id: string) => {
