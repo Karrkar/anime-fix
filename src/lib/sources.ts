@@ -30,6 +30,12 @@ export const SOURCES = {
     hosts: ['vost.pw', 'www.vost.pw', '13.vost.pw'],
     note: 'исторические хосты плеера; v13 добавлен в sources.vost',
   },
+  /** Публичный API animevost — списки серий для плеера (vost-series.ts) */
+  animevostApi: {
+    base: 'https://api.animevost.org/animevost/api/v0.2/GetInfo',
+    hosts: ['api.animevost.org'],
+    note: 'vost.pw убрал var data из HTML (~26.09.2026): список серий — GET /GetInfo/{id}, поле data[0].series (питонья строка-словарь)',
+  },
   /** Парсер хентай-каталога (sync-hentai) */
   hentaibaza: {
     base: 'https://hentaibaza.com',
@@ -73,6 +79,7 @@ export const FEELEX_BASE = SOURCES.feelex.base;
 export const XXX_IGRA_BASE = SOURCES.xxxIgra.base;
 export const R34_BASE = SOURCES.rule34.base;
 export const JINA_READER = SOURCES.jinaReader.base;
+export const ANIMEVOST_API_BASE = SOURCES.animevostApi.base;
 
 /**
  * Белый список хостов для /api/player-proxy.

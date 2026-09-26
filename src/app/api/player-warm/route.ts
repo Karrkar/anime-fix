@@ -4,6 +4,7 @@ import { isCronAuthorized } from '@/lib/cron-auth';
 import { logEvent } from '@/lib/logger';
 import { recordSyncRun } from '@/lib/sync-status';
 import { saveCachedPage } from '@/lib/player-cache';
+import { extractVostId, fetchSeriesFromApi } from '@/lib/vost-series'; // ФИКС 26.09.2026: серии через API
 
 export const dynamic = 'force-dynamic';
 export const maxDuration = 60;
@@ -31,8 +32,11 @@ const PAGE_FETCH_UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 
 const SLICES = 2;
-const TITLES_PER_SLICE = 25;
+const TITLES_PER_SLICE = 50;
 const BUDGET_MS = 50_000;
+/** Пауза после API-запроса (API быстрый и без анти-бота — тартпит не грозит) */
+const API_PAUSE_MS = 250;
+/** Пауза после живого HTML-запроса к vost.pw (вежливость к анти-боту) */
 const PAUSE_MS = 1_200;
 
 /** Тот же маркер, что ищет player-proxy: «var data = {…}» — список серий. */
@@ -107,6 +111,8 @@ export async function GET(request: Request) {
     let warmed = 0;
     let failed = 0;
     let processed = 0;
+    let viaApi = 0;
+    let viaHtml = 0;
 
     for (const row of mySlice) {
       if (Date.now() > startedAt + BUDGET_MS) {
@@ -114,23 +120,32 @@ export async function GET(request: Request) {
         break;
       }
       processed++;
-      const html = await warmFetchPage(row.source_url);
-      if (html) {
-        const entries = parseEpisodeData(html);
-        if (entries) {
-          await saveCachedPage(row.source_url, entries);
-          warmed++;
-        } else {
-          failed++;
-        }
+      // ФИКС 26.09.2026: основной путь — API animevost (vost.pw вырезал список
+      // серий из HTML: «var data = ;»); HTML-скачивание — только фолбэк.
+      let entries: [string, string][] | null = null;
+      let via: 'api' | 'html' = 'api';
+      const vostId = extractVostId(row.source_url);
+      if (vostId) {
+        const api = await fetchSeriesFromApi(vostId, 10_000);
+        if (api?.entries) entries = api.entries;
+      }
+      if (!entries) {
+        via = 'html';
+        const html = await warmFetchPage(row.source_url);
+        if (html) entries = parseEpisodeData(html);
+      }
+      if (entries) {
+        await saveCachedPage(row.source_url, entries);
+        warmed++;
+        if (via === 'api') viaApi++; else viaHtml++;
       } else {
         failed++;
       }
-      await new Promise((r) => setTimeout(r, PAUSE_MS));
+      await new Promise((r) => setTimeout(r, via === 'api' ? API_PAUSE_MS : PAUSE_MS));
     }
 
     const skipped = mySlice.length - processed;
-    const details = { slice, candidates: mySlice.length, processed, warmed, failed, skipped, durationMs: Date.now() - startedAt };
+    const details = { slice, candidates: mySlice.length, processed, warmed, failed, skipped, viaApi, viaHtml, durationMs: Date.now() - startedAt };
     console.log(`player-warm[${slice}]:`, JSON.stringify(details));
     logEvent('player_warm', details, 'info');
     await recordSyncRun(`player:warm:${slice}`, { status: 'ok', details });

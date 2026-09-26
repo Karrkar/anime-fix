@@ -4,6 +4,7 @@ import { withRateLimit } from '@/lib/with-rate-limit';
 import { BoundedTTLCache } from '@/lib/cache';
 import { logEvent } from '@/lib/logger';
 import { PLAYER_PROXY_ALLOWED_HOSTS as ALLOWED_HOSTS, JINA_READER } from '@/lib/sources'; // F-27
+import { extractVostId, fetchSeriesFromApi } from '@/lib/vost-series'; // ФИКС 26.09.2026: серии через API animevost
 import {
   loadCachedPage,
   saveCachedPage,
@@ -93,6 +94,13 @@ function parseEpisodeData(html: string): [string, string][] | null {
 // origin (iframe) и к видео-CDN (поток). Если разбор конфига не удался —
 // откат на старый iframe-вариант (деградация до прежнего поведения).
 // ─────────────────────────────────────────────────────────────────────────────
+// ФИКС 26.09.2026 «плееры опять не работают»: vost.pw ВЫРЕЗАЛ список серий из
+// HTML-страниц («var data = ;» — пустой). Живой разбор страницы теперь всегда
+// проигрывает, вне кэша пользователь получал «Не удалось загрузить серии».
+// Список серий переехал в публичный API api.animevost.org/GetInfo/{id} (поле
+// series — питонья строка-словарь), а frame5.php и видео-CDN работают как
+// раньше. Цепочка: кэш → API (быстро, ~0.3с) → HTML-разбор (фолбэк).
+// ─────────────────────────────────────────────────────────────────────────────
 
 // ── Телеметрия каналов (для &debug=1 и логов) ────────────────────────────────
 interface ChannelDiag {
@@ -106,6 +114,9 @@ const emptyDiag = (): ChannelDiag => ({
   jinaAttempted: false, jinaResult: 'not-attempted',
 });
 let DIAG: Record<string, ChannelDiag> = {};
+
+// ── Диагностика API animevost (?debug=1): 'ok(N)' | 'announced' | 'http-NNN' | 'timeout' | 'no-id' | 'not-attempted'
+let API_DIAG = 'not-attempted';
 
 // ── Здоровье прямого канала к vost.pw (состояние инстанса) ──────────────────
 // После сбоя прямых запросов (тартпит) 10 минут ходим ТОЛЬКО через Jina Reader:
@@ -224,6 +235,27 @@ async function fetchEmbedPage(embedUrl: string): Promise<string | null> {
   );
 }
 
+/** Освежить список серий (фоновая задача для просроченного кэша):
+ * API animevost (быстро, без анти-бота) → HTML-страница (фолбэк). */
+async function refreshSeriesEntries(pageUrl: string): Promise<[string, string][] | null> {
+  const vostId = extractVostId(pageUrl);
+  if (vostId) {
+    const api = await fetchSeriesFromApi(vostId);
+    if (api?.entries) return api.entries;
+  }
+  const html = await fetchVostHtml(
+    pageUrl,
+    {
+      'User-Agent': FETCH_UA,
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+    },
+    [18_000, 12_000],
+    10_000,
+    (h) => h.includes('var data = '),
+  );
+  return html ? parseEpisodeData(html) : null;
+}
+
 /** Только https-ссылки без опасных символов — попадут в HTML-атрибуты src. */
 function sanitizeMediaUrl(u: string): string | null {
   const t = u.trim();
@@ -281,6 +313,7 @@ async function playerProxyHandler(request: NextRequest) {
     const episode = parseInt(searchParams.get('episode') || '1', 10);
     const debugMode = searchParams.get('debug') === '1'; // телеметрия каналов в HTML-комментарии
     DIAG = {};
+    API_DIAG = 'not-attempted';
 
     if (!rawUrl) {
       return NextResponse.json({ error: 'url is required' }, { status: 400 });
@@ -293,10 +326,12 @@ async function playerProxyHandler(request: NextRequest) {
       return NextResponse.json({ error: 'URL not allowed' }, { status: 403 });
     }
 
-    // ── Список серий: память → БД (sync_status) → живой запрос ──
+    // ── Список серий: память → БД (sync_status) → API animevost → HTML (фолбэк) ──
     // ФИКС 3: vost.pw тартпит egress-IP по всплескам запросов, поэтому
     // живой поход — редкость (раз в 12ч на тайтл), остальное берём из БД,
     // переживая рестарты инстансов; при сбое источника отдаём ПРОСРОЧЕННЫЙ кэш.
+    // ФИКС 26.09.2026: живой поход идёт в API animevost (~0.3с, без анти-бота) —
+    // HTML-страницы vost.pw больше не содержат список серий (var data = ;).
     let entries: [string, string][] | null = null;
     const cached = CACHE.get(safeUrl);
 
@@ -325,6 +360,44 @@ async function playerProxyHandler(request: NextRequest) {
         entries = stale;
         CACHE.set(safeUrl, { entries, timestamp: Date.now() });
         void (async () => {
+          const fresh = await refreshSeriesEntries(safeUrl);
+          if (fresh) await saveCachedPage(safeUrl, fresh);
+          else await saveCachedPage(safeUrl, entries!); // ребейз: волна тартпита не ретраится каждым запросом
+        })();
+        logEvent('player_stale_page', { url: safeUrl.slice(0, 120), ageH: Math.round(staleAge / 3.6e6) }, 'warn');
+      }
+
+      // Кэша нет вовсе — быстрый API animevost (основной живой путь),
+      // при его недоступности — прежний живой HTML-запрос (фолбэк).
+      if (!entries) {
+        const vostId = extractVostId(safeUrl);
+        if (vostId) {
+          const api = await fetchSeriesFromApi(vostId);
+          if (api?.entries) {
+            API_DIAG = `ok(${api.entries.length})`;
+            entries = api.entries;
+            CACHE.set(safeUrl, { entries, timestamp: Date.now() });
+            void saveCachedPage(safeUrl, entries); // персистентно, не блокируя ответ
+          } else if (api?.announced) {
+            // API ответил: тайтл существует, но серий ещё нет (анонс) —
+            // честная страница вместо 40с ожидания и «Не удалось загрузить серии»
+            API_DIAG = 'announced';
+            logEvent('player_announced', { vostId, title: (api.title || '').slice(0, 80) }, 'info');
+            const dc = debugMode ? `<!-- player-diag: ${JSON.stringify({ api: API_DIAG, ...DIAG })} -->` : '';
+            return new NextResponse(
+              errorPage('Серии этого тайтла ещё не вышли — он анонсирован. Загляните позже!') + dc,
+              { headers: { 'Content-Type': 'text/html; charset=utf-8' } },
+            );
+          } else {
+            API_DIAG = 'fail';
+          }
+        } else {
+          API_DIAG = 'no-id';
+        }
+
+        // Фолбэк: API не дал серий — живой HTML-запрос (единственный БЛОКИРУЮЩИЙ,
+        // первый визит на тайтл; вне волн — 1-2с, в волну — до 40с)
+        if (!entries) {
           const html = await fetchVostHtml(
             safeUrl,
             {
@@ -332,46 +405,24 @@ async function playerProxyHandler(request: NextRequest) {
               'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
             },
             [18_000, 12_000],
-            10_000,
+            10_000, // Jina бесполезна в волны тартпита (422: её краулер тоже не пробивается) — короткий таймаут
             (h) => h.includes('var data = '),
+            'page',
           );
+
           if (html) {
-            const fresh = parseEpisodeData(html);
-            if (fresh) await saveCachedPage(safeUrl, fresh);
-          } else {
-            await saveCachedPage(safeUrl, entries!); // ребейз: волна тартпита не ретраится каждым запросом
-          }
-        })();
-        logEvent('player_stale_page', { url: safeUrl.slice(0, 120), ageH: Math.round(staleAge / 3.6e6) }, 'warn');
-      }
-
-      // Кэша нет вовсе — единственный БЛОКИРУЮЩИЙ живой запрос (первый визит
-      // на тайтл). Вне волн — 1-2с; в волну — до 40с и страница ошибки.
-      if (!entries) {
-        const html = await fetchVostHtml(
-          safeUrl,
-          {
-            'User-Agent': FETCH_UA,
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-          },
-          [18_000, 12_000],
-          10_000, // Jina бесполезна в волны тартпита (422: её краулер тоже не пробивается) — короткий таймаут
-          (h) => h.includes('var data = '),
-          'page',
-        );
-
-        if (html) {
-          entries = parseEpisodeData(html);
-          if (entries) {
-            CACHE.set(safeUrl, { entries, timestamp: Date.now() });
-            void saveCachedPage(safeUrl, entries); // персистентно, не блокируя ответ
+            entries = parseEpisodeData(html);
+            if (entries) {
+              CACHE.set(safeUrl, { entries, timestamp: Date.now() });
+              void saveCachedPage(safeUrl, entries); // персистентно, не блокируя ответ
+            }
           }
         }
       }
     }
 
     if (!entries || entries.length === 0) {
-      const dc = debugMode ? `<!-- player-diag: ${JSON.stringify(DIAG)} -->` : '';
+      const dc = debugMode ? `<!-- player-diag: ${JSON.stringify({ api: API_DIAG, ...DIAG })} -->` : '';
       return new NextResponse(errorPage('Не удалось загрузить серии. Попробуйте обновить.') + dc, {
         headers: { 'Content-Type': 'text/html; charset=utf-8' },
       });
@@ -435,7 +486,7 @@ async function playerProxyHandler(request: NextRequest) {
       }
     }
 
-    const diagComment = debugMode ? `\n<!-- player-diag: ${JSON.stringify(DIAG)} -->` : '';
+    const diagComment = debugMode ? `\n<!-- player-diag: ${JSON.stringify({ api: API_DIAG, ...DIAG })} -->` : '';
 
     if (parsed) {
       return new NextResponse(videoPlayerPage(parsed.qualities, parsed.poster, safeLabel) + diagComment, {
