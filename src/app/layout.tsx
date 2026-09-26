@@ -32,8 +32,15 @@ export const metadata: Metadata = {
     statusBarStyle: "black-translucent",
   },
   icons: {
+    // Раньше /favicon.ico отдавал 404 → в закладках/встроенных браузерах
+    // рядом со ссылкой не было жёлтой AP-иконки. Возвращаем: ico для
+    // прямых запросов + PNG для остальных размеров.
+    icon: [
+      { url: "/favicon.ico", sizes: "48x48" },
+      { url: "/icons/icon-192.png", sizes: "192x192", type: "image/png" },
+    ],
+    shortcut: "/favicon.ico",
     apple: "/icons/apple-touch-icon.png",
-    icon: "/icons/icon-192.png",
   },
   openGraph: {
     type: "website",

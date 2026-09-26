@@ -1,6 +1,6 @@
 'use client';
 
-import { Search, Heart, Clock, User, Play, Menu, ShieldAlert, Home, List, MoreHorizontal } from 'lucide-react';
+import { Search, Heart, Clock, User, Menu, ShieldAlert, Home, List, MoreHorizontal } from 'lucide-react';
 import { Footer } from '@/components/layout/Footer';
 import { Anime, Page } from '@/lib/client-types';
 
@@ -48,6 +48,30 @@ export function MobileBottomNav({ page, onNavigate, onSearch, favCount, favUpd, 
   );
 }
 
+// ─── Жёлтый AP-значок (лого платформы) ────────────────────────────────────────
+// Тот же дизайн, что favicon/logo.svg: скруглённый жёлтый квадрат
+// с тёмными буквами «AP» и лёгким «дыханием».
+export function ApLogo({ className = '' }: { className?: string }) {
+  return (
+    <svg viewBox="0 0 100 100" className={className} aria-hidden="true" role="presentation">
+      <defs>
+        <linearGradient id="apYellowNav" x1="0%" y1="0%" x2="100%" y2="100%">
+          <stop offset="0%" stopColor="#FFDE45" />
+          <stop offset="55%" stopColor="#FACC15" />
+          <stop offset="100%" stopColor="#EAB308" />
+        </linearGradient>
+      </defs>
+      <rect x="0" y="0" width="100" height="100" rx="24" fill="url(#apYellowNav)" />
+      <g className="ap-logo-breathe" stroke="#0f0f13" fill="none" transform="translate(50,50) scale(0.78) translate(-50,-50)">
+        <path d="M18.5 77 L35.5 26 L52.5 77" strokeWidth="11" strokeLinejoin="round" />
+        <path d="M27.5 54 H43.5" strokeWidth="9" />
+        <path d="M64 77 V26.5" strokeWidth="11" />
+        <path d="M58.5 26.5 H72 A10.5 10.5 0 0 1 72 47.5 H64" strokeWidth="11" strokeLinejoin="round" />
+      </g>
+    </svg>
+  );
+}
+
 // ─── Desktop + Mobile More Menu ────────────────────────────────────
 export function Navbar({ page, onNavigate, onSearch, favCount, favUpd, onMoreOpen }: {
   page: Page; onNavigate: (p: Page) => void; onSearch: () => void; favCount: number; favUpd: number; onMoreOpen: () => void;
@@ -65,8 +89,8 @@ export function Navbar({ page, onNavigate, onSearch, favCount, favUpd, onMoreOpe
   return (
     <header className="sticky top-0 z-50 bg-[var(--background)]/95 backdrop-blur-md border-b border-[var(--border)]">
       <div className="max-w-7xl mx-auto px-4 h-12 sm:h-14 flex items-center justify-between">
-        <button onClick={() => onNavigate('home')} className="flex items-center gap-1.5 sm:gap-2 font-bold text-base sm:text-lg text-[var(--primary)] hover:opacity-80 transition-opacity">
-          <Play className="w-4 h-4 sm:w-5 sm:h-5" fill="currentColor" /> <span className="hidden xs:inline">Anime</span>Platform
+        <button onClick={() => onNavigate('home')} className="flex items-center gap-1.5 sm:gap-2 font-bold text-base sm:text-lg text-[var(--primary)] hover:opacity-80 transition-opacity" aria-label="AnimePlatform — на главную">
+          <ApLogo className="w-6 h-6 sm:w-7 sm:h-7 shrink-0 drop-shadow-[0_1px_3px_rgba(250,204,21,0.35)]" /> <span className="hidden xs:inline">Anime</span>Platform
         </button>
         <nav className="hidden md:flex items-center gap-1">
           {links.map(l => {

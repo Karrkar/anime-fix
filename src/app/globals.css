@@ -128,6 +128,15 @@ video {
   animation: fadeIn 0.3s ease-out;
 }
 
+/* Жёлтый AP-значок бренда — лёгкое «дыхание» букв (как в logo.svg) */
+@keyframes apBreathe {
+  0%, 100% { opacity: 0.75; }
+  50% { opacity: 1; }
+}
+.ap-logo-breathe {
+  animation: apBreathe 2.5s ease-in-out infinite;
+}
+
 /* 18+ section enhancements */
 @keyframes glowPulse {
   0%, 100% { opacity: 0.5; }

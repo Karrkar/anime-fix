@@ -2,7 +2,7 @@
  * Service Worker AnimePlatform (PWA).
  *
  * Стратегии:
- *  - /_next/static/*, /icons/*, /logo.svg → cache-first (неменные хэшируемые ассеты)
+ *  - /_next/static/*, /icons/*, /logo.svg, /favicon.ico → cache-first (неменные хэшируемые ассеты)
  *  - навигация (HTML) → network-first, офлайн-фолбэк на закэшированную «/»
  *  - /api/* → СЕТЬ ТОЛЬКО (никогда не кэшируем: чат, гейты, каталог меняются)
  *  - постеры и прочие картинки → cache-first c лимитом записей
@@ -10,14 +10,14 @@
  * Версия CACHE_VERSION: при деплое нового кода Next меняет хэши статики,
  * но старые записи всё равно чистим активацией (cleanup old caches).
  */
-const CACHE_VERSION = 'ap-v2';
+const CACHE_VERSION = 'ap-v3';
 const STATIC_CACHE = `${CACHE_VERSION}-static`;
 const IMG_CACHE = `${CACHE_VERSION}-img`;
 const IMG_CACHE_MAX = 120;
 
 self.addEventListener('install', (event) => {
   event.waitUntil(
-    caches.open(STATIC_CACHE).then((c) => c.addAll(['/', '/logo.svg'])).then(() => self.skipWaiting())
+    caches.open(STATIC_CACHE).then((c) => c.addAll(['/', '/logo.svg', '/favicon.ico'])).then(() => self.skipWaiting())
   );
 });
 
@@ -36,6 +36,7 @@ function isStaticAsset(url) {
   return (
     url.pathname.startsWith('/_next/static/') ||
     url.pathname === '/logo.svg' ||
+    url.pathname === '/favicon.ico' ||
     url.pathname.startsWith('/icons/')
   );
 }
