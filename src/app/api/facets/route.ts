@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server';
 import { withRateLimit } from '@/lib/with-rate-limit';
 import { getDb } from '@/lib/db';
+import { BoundedTTLCache } from '@/lib/cache';
 
 /**
  * GET /api/facets — справочник фильтров каталога: жанры, типы, счётчик свежего.
@@ -8,10 +9,24 @@ import { getDb } from '@/lib/db';
  * Один лёгкий запрос select('genres,type,created_at') по is_adult=false
  * (агрегация жанров по строке через запятую делается в JS — значений ~тысячи,
  * это дешевле, чем материализованные таблицы). Результат для /api/catalog UI.
+ *
+ * F-PERF: справочник меняется только кронами синка (раз в сутки) — раньше
+ * все 5000 строк собирались заново на каждый показ каталога. Теперь ответ
+ * кэшируется на 10 минут в памяти и на CDN Vercel.
  */
 const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
+const FACETS_TTL_MS = 10 * 60_000;
+const facetsCache = new BoundedTTLCache<string, string>(4, FACETS_TTL_MS);
+const FACETS_CACHE_CTRL = 'public, max-age=600, s-maxage=600, stale-while-revalidate=1800';
 
 async function facetsHandler() {
+  const hit = facetsCache.get('facets');
+  if (hit) {
+    return new NextResponse(hit, {
+      status: 200,
+      headers: { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': FACETS_CACHE_CTRL },
+    });
+  }
   try {
     const db = getDb();
     const { data, error } = await db
@@ -54,7 +69,12 @@ async function facetsHandler() {
       .map(([name, count]) => ({ name, count }))
       .sort((a, b) => b.count - a.count || a.name.localeCompare(b.name, 'ru'));
 
-    return NextResponse.json({ genres, types, fresh, source: 'database' });
+    const body = JSON.stringify({ genres, types, fresh, source: 'database' });
+    facetsCache.set('facets', body);
+    return new NextResponse(body, {
+      status: 200,
+      headers: { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': FACETS_CACHE_CTRL },
+    });
   } catch (e) {
     console.error('Facets DB error:', e);
     return NextResponse.json({ genres: [], types: [], fresh: 0, source: 'database-error' });

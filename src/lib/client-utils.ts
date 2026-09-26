@@ -41,8 +41,22 @@ export function authHeaders(): Record<string, string> {
   return token ? { 'Authorization': `Bearer ${token}` } : {};
 }
 
+// F-PERF: эти GET-эндпоинты публичные (сервер авторизацию не проверяет), а
+// запрос с заголовком Authorization CDN Vercel принципиально НЕ кэширует —
+// залогиненные пользователи оставались без edge-ускорения. Cookie всё равно
+// уходит автоматически, для этих маршрутов он не нужен.
+const PUBLIC_GET_PATHS = new Set(['/api/catalog', '/api/anime', '/api/facets', '/api/random', '/api/search']);
+
+function isPublicGet(url: string): boolean {
+  if (typeof window === 'undefined') return false;
+  try {
+    return PUBLIC_GET_PATHS.has(new URL(url, window.location.origin).pathname);
+  } catch { return false; }
+}
+
 export async function apiFetch<T>(url: string, init?: RequestInit): Promise<T> {
-  let r = await fetch(url, { ...init, headers: { ...authHeaders(), ...init?.headers } });
+  const auth = init?.method || !isPublicGet(url) ? authHeaders() : {};
+  let r = await fetch(url, { ...init, headers: { ...auth, ...init?.headers } });
   // ФИКС race condition age-cookie: пользователь подтвердил 18+ (localStorage
   // валиден), но серверная cookie anime_age_confirmed ещё не поставилась или
   // была очищена — 18+-маршрут отвечает 403. Восстанавливаем cookie и

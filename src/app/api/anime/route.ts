@@ -3,6 +3,20 @@ import { mapToCamel, preferRussianTitle } from '@/lib/anime-utils'; // F-08: б�
 import { withRateLimit } from '@/lib/with-rate-limit';
 import { validateAnimeId } from '@/lib/validate';
 import { getDb } from '@/lib/db';
+import { BoundedTTLCache } from '@/lib/cache';
+
+// F-PERF: кэш списков/карточек — главная дёргает /api/anime?limit=… при каждом
+// открытии, а контент меняется только кронами. 60с (списки) / 300с (карточка).
+const listCache = new BoundedTTLCache<string, string>(100, 60_000);
+const ANIME_CACHE_CTRL = 'public, max-age=60, s-maxage=60, stale-while-revalidate=300';
+const ID_CACHE_CTRL = 'public, max-age=300, s-maxage=300, stale-while-revalidate=600';
+
+function cachedJson(body: string, cacheCtrl: string): NextResponse {
+  return new NextResponse(body, {
+    status: 200,
+    headers: { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': cacheCtrl },
+  });
+}
 
 function toCamel(obj: Record<string, unknown>): Record<string, unknown> {
   const out: Record<string, unknown> = {};
@@ -49,13 +63,19 @@ async function animeHandler(request: NextRequest) {
       const validId = validateAnimeId(id);
       if (!validId) return NextResponse.json({ error: 'Invalid id' }, { status: 400 });
 
+      const idKey = `id|${validId}`;
+      const idHit = listCache.get(idKey);
+      if (idHit) return cachedJson(idHit, ID_CACHE_CTRL);
+
       // Check DB first for dynamic anime
       if (validId.startsWith('db-')) {
         const vostId = parseInt(validId.replace('db-', ''), 10);
         const db = getDb();
         const { data } = await db.from('anime_catalog').select('*').eq('vost_id', vostId).maybeSingle();
         if (data) {
-          return NextResponse.json({ anime: toCamel(dbRowToAnime(data as Record<string, unknown>)) });
+          const body = JSON.stringify({ anime: toCamel(dbRowToAnime(data as Record<string, unknown>)) });
+          listCache.set(idKey, body);
+          return cachedJson(body, ID_CACHE_CTRL);
         }
       }
 
@@ -63,11 +83,17 @@ async function animeHandler(request: NextRequest) {
       const { findAnimeById } = await import('@/lib/data');
       const anime = findAnimeById(validId);
       if (!anime) return NextResponse.json({ error: 'Not found' }, { status: 404 });
-      return NextResponse.json({ anime: toCamel(anime as unknown as Record<string, unknown>) });
+      const body = JSON.stringify({ anime: toCamel(anime as unknown as Record<string, unknown>) });
+      listCache.set(idKey, body);
+      return cachedJson(body, ID_CACHE_CTRL);
     }
 
     // List mode with limit/offset — merge DB (new) + static
     if (limit > 0) {
+      const listKey = `list|${limit}|${offset}`;
+      const listHit = listCache.get(listKey);
+      if (listHit) return cachedJson(listHit, ANIME_CACHE_CTRL);
+
       let dbAnime: Record<string, unknown>[] = [];
       try {
         const db = getDb();
@@ -80,26 +106,29 @@ async function animeHandler(request: NextRequest) {
         if (data) dbAnime = data as unknown as Record<string, unknown>[];
       } catch { /* fallback to static */ }
 
+      let body: string;
       if (dbAnime.length >= limit) {
-        return NextResponse.json({
+        body = JSON.stringify({
           anime: mapToCamel(dbAnime.map(dbRowToAnime)),
           total: dbAnime.length,
           source: 'database',
         });
+      } else {
+        // Fill remaining slots with static data (ленивый импорт — F-08)
+        const { SFW_ANIME } = await import('@/lib/data');
+        const staticOffset = Math.max(0, offset - dbAnime.length);
+        const remaining = limit - dbAnime.length;
+        const staticAnime = mapToCamel(SFW_ANIME.slice(staticOffset, staticOffset + remaining));
+        const merged = [...mapToCamel(dbAnime.map(dbRowToAnime)), ...staticAnime];
+
+        body = JSON.stringify({
+          anime: merged,
+          total: merged.length,
+          source: 'mixed',
+        });
       }
-
-      // Fill remaining slots with static data (ленивый импорт — F-08)
-      const { SFW_ANIME } = await import('@/lib/data');
-      const staticOffset = Math.max(0, offset - dbAnime.length);
-      const remaining = limit - dbAnime.length;
-      const staticAnime = mapToCamel(SFW_ANIME.slice(staticOffset, staticOffset + remaining));
-      const merged = [...mapToCamel(dbAnime.map(dbRowToAnime)), ...staticAnime];
-
-      return NextResponse.json({
-        anime: merged,
-        total: merged.length,
-        source: 'mixed',
-      });
+      listCache.set(listKey, body);
+      return cachedJson(body, ANIME_CACHE_CTRL);
     }
 
     // F-08: ленивая загрузка статического массива вместо статического импорта

@@ -2,20 +2,31 @@ import { NextResponse } from 'next/server';
 import { mapToCamel, preferRussianTitle } from '@/lib/anime-utils';
 import { withRateLimit } from '@/lib/with-rate-limit';
 import { getDb } from '@/lib/db';
+import { BoundedTTLCache } from '@/lib/cache';
 
 /**
  * GET /api/random — случайный тайтл из каталога (is_adult=false).
  *
  * DB-first: count → случайный offset → одна строка (два дешёвых запроса).
  * Если БД недоступна/пуста — случайный тайтл из статического массива.
+ *
+ * F-PERF: сам тайтл остаётся случайным на каждый запрос, но total каталога
+ * меняется только кронами — счётчик кэшируется на 60с (минус один рейс в БД).
  */
+const countCache = new BoundedTTLCache<string, number>(2, 60_000);
+
 async function randomHandler() {
   try {
     const db = getDb();
-    const { count } = await db
-      .from('anime_catalog')
-      .select('*', { count: 'exact', head: true })
-      .eq('is_adult', false);
+    let count = countCache.get('count');
+    if (count === null) {
+      const res = await db
+        .from('anime_catalog')
+        .select('*', { count: 'exact', head: true })
+        .eq('is_adult', false);
+      count = res.count || 0;
+      if (count > 0) countCache.set('count', count);
+    }
 
     if (count && count > 0) {
       const idx = Math.floor(Math.random() * count);
