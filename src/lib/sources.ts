@@ -104,6 +104,21 @@ export function isAllowedR34Host(hostname: string): boolean {
   return h === 'rule34.xxx' || h.endsWith('.rule34.xxx');
 }
 
+/**
+ * ФИКС 26.09.2026 (медленный запуск видео): mp4 vost.pw раздают CDN-зеркала
+ * tigerlips.org (lando., vn5614., …) и trn.su (ram., fhd., res., …) с
+ * ротирующимися поддоменами. Из РФ эти CDN часто медленные/недоступны у
+ * провайдеров — браузер часами смотрит на спиннер. Лечится стриминг-прокси
+ * /api/player-proxy?video=… : проверяем хост так же wildcard'ом
+ * (суффикс-граница с точкой не пропускает tigerlips.org.evil.com).
+ */
+export const VOST_VIDEO_CDN_SUFFIXES: readonly string[] = ['tigerlips.org', 'trn.su'];
+
+export function isAllowedVostVideoHost(hostname: string): boolean {
+  const h = hostname.toLowerCase();
+  return VOST_VIDEO_CDN_SUFFIXES.some(s => h === s || h.endsWith('.' + s));
+}
+
 /** Хосты постеров/картинок для next/image (remotePatterns в next.config.ts) */
 export const IMAGE_HOSTS: readonly string[] = [
   ...new Set([

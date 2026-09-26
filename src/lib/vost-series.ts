@@ -57,8 +57,25 @@ export interface ApiSeriesResult {
 }
 
 /**
+ * Настоящий ли это анонс: источник помечает такие тайтлы маркером «Анонс»
+ * в title («…[Анонс] [1 серия - 10 октября]»). Пустой series без маркера —
+ * вероятная деградация API, ей доверять нельзя.
+ */
+export function isAnnouncedTitle(title: string): boolean {
+  return /анонс/i.test(title);
+}
+
+/**
  * Список серий тайтла из API animevost.
- * @returns null — API недоступен/тайтл не найден (звать HTML-фолбэк);
+ *
+ * ПУСТОЙ series ≠ всегда «анонс»: API под нагрузкой может вернуть пустое
+ * поле и для тайтла с вышедшими сериями. Настоящие анонсы источник помечает
+ * в title маркером «[Анонс]» (например: «…[Анонс] [1 серия - 10 октября]»).
+ * Пустой series БЕЗ маркера трактуем как деградацию API → null (звавший
+ * фолбэкнется на просроченный кэш), чтобы не затирать хорошие данные
+ * и не показывать пользователю ложное «серии ещё не вышли».
+ *
+ * @returns null — API недоступен/тайтл не найден/пустой series без маркера (звать HTML-фолбэк);
  *          { entries: null, announced: true } — серий нет, показываем «анонс».
  */
 export async function fetchSeriesFromApi(
@@ -77,6 +94,7 @@ export async function fetchSeriesFromApi(
     const entries = parseApiSeries(info.series);
     if (entries) return { entries, announced: false };
     const title = typeof info.title === 'string' ? info.title : '';
+    if (!isAnnouncedTitle(title)) return null; // пусто без маркера — не верим
     return { entries: null, announced: true, title: title.slice(0, 120) };
   } catch {
     return null;

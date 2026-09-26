@@ -5,7 +5,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { extractVostId, parseApiSeries } from '../src/lib/vost-series';
+import { extractVostId, parseApiSeries, isAnnouncedTitle } from '../src/lib/vost-series';
 
 /* ── extractVostId ── */
 
@@ -82,4 +82,24 @@ test('parseApiSeries: большая строка не рвётся (1000 сер
   assert.ok(out);
   assert.equal(out.length, 1000);
   assert.deepEqual(out[999], ['1000 серия', '1001000']);
+});
+
+/* ── isAnnouncedTitle: пустой series доверяем только с маркером «Анонс» ── */
+
+test('isAnnouncedTitle: маркер в скобках (формат API) → анонс', () => {
+  assert.ok(isAnnouncedTitle('Маска вермильона / Shuiro no Kamen [Анонс] [1 серия - 10 октября]'));
+  assert.ok(isAnnouncedTitle('Тайтл [анонс]'));
+});
+
+test('isAnnouncedTitle: тайтл с сериями → НЕ анонс', () => {
+  assert.equal(isAnnouncedTitle('Красная река / Sora wa Akai Kawa no Hotori [1-12 из 24]'), false);
+  assert.equal(isAnnouncedTitle('Re:Zero kara Hajimeru Isekai Seikatsu 4th Season'), false);
+  assert.equal(isAnnouncedTitle(''), false);
+});
+
+test('isAnnouncedTitle: слово «анонс» внутри описания-хвоста тоже покрывается', () => {
+  // Перестраховка: лучше ложный «анонс», чем ложная «деградация» —
+  // пустой series при вышедших сериях встречается только при баге источника,
+  // а слово «Анонс» в названии не-анонса источник не пишет.
+  assert.ok(isAnnouncedTitle('Какой-то тайтл (анонс на осень)'));
 });

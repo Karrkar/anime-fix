@@ -7,6 +7,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
 import {
+  isAllowedVostVideoHost,
   SOURCES,
   VOST_BASE,
   HB_BASE,
@@ -70,4 +71,25 @@ test('хост источника vost совпадает с хостом из �
     // base-URL обязан указывать на семейство собственных хостов
     assert.ok(selfHost || def.hosts.some(h => origin.includes(h.split('.')[0])), `base ${def.base} не согласован с hosts`);
   }
+});
+
+/* ── Видео-CDN vost.pw для стриминг-прокси (фикс 26.09.2026) ── */
+
+test('isAllowedVostVideoHost: зеркала tigerlips.org / trn.su разрешены', () => {
+  assert.ok(isAllowedVostVideoHost('lando.tigerlips.org'));
+  assert.ok(isAllowedVostVideoHost('vn5614.tigerlips.org'));
+  assert.ok(isAllowedVostVideoHost('tigerlips.org'));
+  assert.ok(isAllowedVostVideoHost('ram.trn.su'));
+  assert.ok(isAllowedVostVideoHost('fhd.trn.su'));
+  assert.ok(isAllowedVostVideoHost('res.trn.su'));
+  assert.ok(isAllowedVostVideoHost('trn.su'));
+});
+
+test('isAllowedVostVideoHost: чужие и «имитирующие» домены запрещены (SSRF)', () => {
+  assert.equal(isAllowedVostVideoHost('tigerlips.org.evil.com'), false);
+  assert.equal(isAllowedVostVideoHost('trn.su.example.com'), false);
+  assert.equal(isAllowedVostVideoHost('evil-tigerlips.org'), false);
+  assert.equal(isAllowedVostVideoHost('v13.vost.pw'), false); // страницы — не видео-CDN
+  assert.equal(isAllowedVostVideoHost(''), false);
+  assert.equal(isAllowedVostVideoHost('LANDO.TIGERLIPS.ORG'.toLowerCase()), true); // регистр не важен
 });

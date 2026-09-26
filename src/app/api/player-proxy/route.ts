@@ -3,7 +3,7 @@ import { validateExternalUrlWithDns } from '@/lib/url-guard';
 import { withRateLimit } from '@/lib/with-rate-limit';
 import { BoundedTTLCache } from '@/lib/cache';
 import { logEvent } from '@/lib/logger';
-import { PLAYER_PROXY_ALLOWED_HOSTS as ALLOWED_HOSTS, JINA_READER } from '@/lib/sources'; // F-27
+import { PLAYER_PROXY_ALLOWED_HOSTS as ALLOWED_HOSTS, JINA_READER, isAllowedVostVideoHost } from '@/lib/sources'; // F-27
 import { extractVostId, fetchSeriesFromApi } from '@/lib/vost-series'; // ФИКС 26.09.2026: серии через API animevost
 import {
   loadCachedPage,
@@ -309,6 +309,20 @@ function parsePlayerConfig(html: string): ParsedPlayer | null {
 async function playerProxyHandler(request: NextRequest) {
   try {
     const { searchParams } = new URL(request.url);
+
+    // ── Режим видео-стриминга: /api/player-proxy?video=<CDN-url> ──
+    // ФИКС 26.09.2026 («видео медленно грузится и не запускается»): mp4 vost.pw
+    // раздаются напрямую с CDN (tigerlips.org / trn.su) в браузер пользователя.
+    // Из РФ эти CDN часто медленные/блокируются провайдером — браузер часами
+    // смотрит на спиннер. Здесь видео льётся ЧЕРЕЗ платформу: пользователь
+    // качает с anime-fix.vercel.app (для него быстрый), Vercel сам тянет у CDN.
+    // Range-запросы переадресуем (сики/перемотка работают), тело стримим
+    // без буферизации в память, отмену клиента прокидываем в upstream.
+    const rawVideo = searchParams.get('video');
+    if (rawVideo) {
+      return await videoStreamHandler(request, rawVideo);
+    }
+
     const rawUrl = searchParams.get('url');
     const episode = parseInt(searchParams.get('episode') || '1', 10);
     const debugMode = searchParams.get('debug') === '1'; // телеметрия каналов в HTML-комментарии
@@ -515,6 +529,76 @@ async function playerProxyHandler(request: NextRequest) {
 
 export const GET = withRateLimit(playerProxyHandler, '/api/player-proxy')
 
+/* ────────────────── Стриминг видео через платформу ────────────────── */
+
+/** Пробрасываемые заголовки ответа CDN → клиенту (сики/кеши браузера). */
+const VIDEO_PASS_HEADERS = [
+  'content-type',
+  'content-length',
+  'content-range',
+  'accept-ranges',
+  'etag',
+  'last-modified',
+] as const;
+
+async function videoStreamHandler(request: NextRequest, rawVideo: string): Promise<NextResponse> {
+  let parsed: URL;
+  try {
+    parsed = new URL(rawVideo);
+  } catch {
+    return NextResponse.json({ error: 'invalid video url' }, { status: 400 });
+  }
+  if (parsed.protocol !== 'https:' || !isAllowedVostVideoHost(parsed.hostname)) {
+    logEvent('ssrf_blocked', { mode: 'video', url: rawVideo.slice(0, 200) }, 'warn');
+    return NextResponse.json({ error: 'video host not allowed' }, { status: 403 });
+  }
+
+  // Только mp4 (защита от проксирования страниц/мусора через видео-режим)
+  if (!/\.mp4(?:\?|$)/i.test(parsed.pathname + parsed.search)) {
+    return NextResponse.json({ error: 'not a video url' }, { status: 400 });
+  }
+
+  try {
+    const range = request.headers.get('range');
+    const upstream = await fetch(parsed.toString(), {
+      headers: {
+        'User-Agent': FETCH_UA,
+        Accept: '*/*',
+        ...(range ? { Range: range } : {}),
+      },
+      // отмена на стороне браузера → гасим и upstream-запрос (не жгём трафик CDN)
+      signal: request.signal,
+      redirect: 'follow',
+    });
+
+    const headers = new Headers();
+    for (const h of VIDEO_PASS_HEADERS) {
+      const v = upstream.headers.get(h);
+      if (v) headers.set(h, v);
+    }
+    if (!headers.has('accept-ranges')) headers.set('accept-ranges', 'bytes');
+    if (!headers.has('content-type')) headers.set('content-type', 'video/mp4');
+    // CDN-ссылки стабильны часами (time-токен в URL) — края Vercel кэшируют
+    // повторные запросы того же фрагмента, экономя и лимиты функций, и трафик.
+    headers.set('Cache-Control', 'public, max-age=0, s-maxage=10800, stale-while-revalidate=86400');
+    headers.set('X-Content-Type-Options', 'nosniff');
+
+    // 2xx/206 пропускаем как есть; ошибки CDN — коротким ответом (клиентский
+    // JS плеера переключится на прямую ссылку/зеркало — см. videoPlayerPage)
+    if (!upstream.ok && upstream.status !== 206) {
+      await upstream.body?.cancel();
+      return NextResponse.json({ error: 'cdn error', status: upstream.status }, { status: 502 });
+    }
+
+    return new NextResponse(upstream.body, { status: upstream.status, headers });
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    // AbortError — клиент ушёл (норма при переключении зеркал), не логируем
+    if (!/aborted/i.test(msg)) logEvent('player_video_stream', { host: parsed.hostname, err: msg.slice(0, 120) }, 'warn');
+    return NextResponse.json({ error: 'stream failed' }, { status: 502 });
+  }
+}
+
 /* ────────────────── Собственная страница плеера ────────────────── */
 
 function escapeAttr(s: string): string {
@@ -542,8 +626,9 @@ function videoPlayerPage(
     html,body{width:100%;height:100%;overflow:hidden;background:#000;font-family:system-ui,sans-serif}
     #wrap{position:relative;width:100%;height:100%}
     video{width:100%;height:100%;object-fit:contain;background:#000}
-    #load{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,.55);transition:opacity .3s}
+    #load{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;background:rgba(0,0,0,.55);transition:opacity .3s}
     #load .spin{width:46px;height:46px;border:3px solid rgba(168,85,247,.25);border-top-color:#a855f7;border-radius:50%;animation:sp 1s linear infinite}
+    #load .txt{color:#c4b5fd;font-size:12px;font-family:system-ui,sans-serif;text-shadow:0 1px 2px #000}
     @keyframes sp{to{transform:rotate(360deg)}}
     #qbar{position:absolute;top:8px;right:8px;display:flex;gap:6px;z-index:5}
     #qbar button{padding:4px 10px;border:1px solid rgba(255,255,255,.25);border-radius:6px;background:rgba(15,10,25,.75);color:#ddd;font-size:12px;cursor:pointer;backdrop-filter:blur(4px)}
@@ -557,15 +642,32 @@ function videoPlayerPage(
 <body>
   <div id="wrap">
     <video id="v" controls playsinline preload="metadata" controlslist="nodownload"${posterAttr}></video>
+    <div id="load"><div class="spin"></div><div class="txt" id="loadtxt">Загрузка видео…</div></div>
     <div id="qbar"></div>
-    <div id="load"><div class="spin"></div></div>
-    <div id="err"><b id="errmsg">Ошибка воспроизведения</b><small>Источник видео недоступен или ссылка устарела</small><button onclick="location.reload()">Обновить</button></div>
+    <div id="err"><b id="errmsg">Ошибка воспроизведения</b><small>Источник видео недоступен или ссылка устарела</small><button onclick="location.reload()">Обновить</button><button onclick="try{localStorage.removeItem('vost_via_proxy')}catch(e){};location.reload()">Напрямую с источника</button></div>
   </div>
   <script>
   (function(){
     var QUALITIES = ${dataJson};
     var v = document.getElementById('v'), load = document.getElementById('load'),
-        err = document.getElementById('err'), qbar = document.getElementById('qbar');
+        err = document.getElementById('err'), qbar = document.getElementById('qbar'),
+        loadtxt = document.getElementById('loadtxt');
+    // ФИКС 26.09.2026 («медленно грузится и не запускается»): у части
+    // пользователей (провайдеры РФ) CDN источника (tigerlips.org / trn.su)
+    // медленный или недоступен — видео «грузится вечно». Логика: сначала
+    // ПРЯМОЙ CDN (быстро, если доступен); при ошибке или 7с без метаданных —
+    // тот же файл ЧЕРЕЗ платформу (/api/player-proxy?video=…), выбор помним
+    // 12ч. Дальше — зеркала и качества пониже, как раньше.
+    var PROXY = '/api/player-proxy?video=';
+    var LS_KEY = 'vost_via_proxy', LS_TTL = 12 * 60 * 60 * 1000;
+    var viaProxy = false;
+    try {
+      var memo = JSON.parse(localStorage.getItem(LS_KEY) || 'null');
+      if (memo && typeof memo.t === 'number' && Date.now() - memo.t < LS_TTL) viaProxy = memo.on === 1;
+    } catch(e) {}
+    function rememberProxy(on){
+      try { localStorage.setItem(LS_KEY, JSON.stringify({ on: on ? 1 : 0, t: Date.now() })); } catch(e) {}
+    }
     // Качество по умолчанию: HD/720 при наличии, иначе первое
     var qi = (function(){
       for (var i = 0; i < QUALITIES.length; i++) {
@@ -574,9 +676,38 @@ function videoPlayerPage(
       return 0;
     })();
     var mi = 0; // индекс зеркала внутри качества
-    var startedAt = 0, wasPlaying = false;
+    var wasPlaying = false, metaTimer = null;
 
-    function src(){ return QUALITIES[qi].urls[mi]; }
+    function raw(){ return QUALITIES[qi].urls[mi]; }
+    function src(){ return viaProxy ? PROXY + encodeURIComponent(raw()) : raw(); }
+    // Прямому CDN даём 7с на метаданные; тишина — как ошибка (уходим на прокси)
+    function armMetaWatch(){
+      if (v.readyState >= 1) return;
+      clearTimeout(metaTimer);
+      metaTimer = setTimeout(function(){ fail(); }, 7000);
+    }
+    function fail(){
+      clearTimeout(metaTimer);
+      if (!viaProxy) {
+        viaProxy = true;
+        rememberProxy(true);
+        if (loadtxt) loadtxt.textContent = 'Источник медленный — переключаюсь на резерв…';
+        applySrc(true);
+        return;
+      }
+      // Ошибка потока: сначала следующие зеркала того же качества, затем качества ниже
+      if (mi + 1 < QUALITIES[qi].urls.length) {
+        mi++;
+        applySrc(true);
+        return;
+      }
+      if (qi + 1 < QUALITIES.length) {
+        qi++; mi = 0;
+        applySrc(true);
+        return;
+      }
+      load.style.display='none'; err.style.display='flex';
+    }
     function applySrc(keepTime){
       var t = keepTime ? v.currentTime : 0, play = keepTime && wasPlaying;
       v.src = src();
@@ -587,6 +718,7 @@ function videoPlayerPage(
           if (play) v.play().catch(function(){});
         });
       }
+      armMetaWatch();
       renderQbar();
     }
     function renderQbar(){
@@ -606,24 +738,12 @@ function videoPlayerPage(
       });
     }
     function hideLoad(){load.style.opacity='0';setTimeout(function(){load.style.display='none'},350)}
+    v.addEventListener('loadedmetadata', function(){ clearTimeout(metaTimer); });
     v.addEventListener('loadeddata', hideLoad);
     v.addEventListener('canplay', hideLoad);
     v.addEventListener('playing', hideLoad);
     v.addEventListener('pause', function(){ wasPlaying = false; });
-    v.addEventListener('error', function(){
-      // Ошибка потока: сначала следующие зеркала того же качества, затем качества ниже
-      if (mi + 1 < QUALITIES[qi].urls.length) {
-        mi++;
-        applySrc(true);
-        return;
-      }
-      if (qi + 1 < QUALITIES.length) {
-        qi++; mi = 0;
-        applySrc(true);
-        return;
-      }
-      load.style.display='none'; err.style.display='flex';
-    });
+    v.addEventListener('error', fail);
     v.addEventListener('stalled', function(){ load.style.display='flex'; load.style.opacity='1'; });
     setTimeout(hideLoad, 15000);
 
