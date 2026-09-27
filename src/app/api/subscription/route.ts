@@ -54,7 +54,20 @@ function getReceiverWallet(): string {
  * successURL возвращает пользователя на сайт после оплаты — там его подхватит
  * авто-опрос статуса подписки.
  */
-function buildYooMoneyUrl(plan: Plan, label: string): string | null {
+/**
+ * Домен, на котором пользователь оформляет подписку (для successURL ЮMoney).
+ * Берём из заголовков запроса — платёж возвращает человека на ТОТ ЖЕ домен,
+ * с которого он платил (animeplatforma-new.online / anime-fix.vercel.app / …),
+ * а не на захардкоженный. 09.2026: при переезде на собственный домен жёстко
+ * зашитый successURL ломал возврат после оплаты (ссылки менялись).
+ */
+function getSuccessUrl(request: NextRequest): string {
+  const host = request.headers.get('x-forwarded-host') || request.headers.get('host') || 'animeplatforma-new.online';
+  const proto = request.headers.get('x-forwarded-proto') || 'https';
+  return `${proto}://${host}/`;
+}
+
+function buildYooMoneyUrl(plan: Plan, label: string, successUrl: string): string | null {
   const receiver = getReceiverWallet();
   if (!receiver) return null;
   const params = new URLSearchParams({
@@ -63,7 +76,7 @@ function buildYooMoneyUrl(plan: Plan, label: string): string | null {
     'paymentType': 'AC',
     sum: String(plan.price),
     label: label.slice(0, 64),
-    successURL: 'https://anime-fix.vercel.app/',
+    successURL: successUrl,
   })
   return `https://yoomoney.ru/quickpay/confirm?${params.toString()}`
 }
@@ -248,7 +261,7 @@ async function subscriptionHandler(request: NextRequest) {
       // Основная ссылка — «Перевод по кнопке» (сумма тарифа подставляется,
       // label уходит в вебхук для точного матчинга);
       // запасная — персональная страница /to/ (без автосуммы и label).
-      const paymentUrl = buildYooMoneyUrl(plan, label)
+      const paymentUrl = buildYooMoneyUrl(plan, label, getSuccessUrl(request))
       const paymentUrlQuickpay = buildTransferUrl(plan)
 
       // F-02 fix: раньше при пустом receiver молча генерировалась битая ссылка.
