@@ -23,6 +23,10 @@
     {
       "path": "/api/player-warm?slice=1",
       "schedule": "30 6 * * *"
+    },
+    {
+      "path": "/api/watchdog",
+      "schedule": "30 8 * * *"
     }
   ]
 }

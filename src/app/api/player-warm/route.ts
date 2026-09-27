@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server';
-import { getDb } from '@/lib/db';
+import { getDb, authFromRequest } from '@/lib/db';
 import { isCronAuthorized } from '@/lib/cron-auth';
 import { logEvent } from '@/lib/logger';
 import { recordSyncRun } from '@/lib/sync-status';
@@ -85,7 +85,10 @@ async function warmFetchPage(url: string): Promise<string | null> {
 }
 
 export async function GET(request: Request) {
-  if (!isCronAuthorized(request)) {
+  // Аудит 27.09.2026: + админ-сессия — для watchdog/ручного запуска.
+  const user = await authFromRequest(request);
+  const isAdmin = !!user && user.role === 'admin';
+  if (!isCronAuthorized(request) && !isAdmin) {
     return NextResponse.json({ error: 'Forbidden' }, { status: 403 });
   }
 

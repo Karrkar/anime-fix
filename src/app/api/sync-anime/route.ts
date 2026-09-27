@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server';
-import { getDb, cleanupExpiredSessions } from '@/lib/db';
+import { getDb, cleanupExpiredSessions, authFromRequest } from '@/lib/db';
 import { isCronAuthorized } from '@/lib/cron-auth';
 import { logEvent } from '@/lib/logger';
 import { notifyTelegram } from '@/lib/notify';
@@ -189,7 +189,11 @@ async function refreshExistingEpisodes(db: ReturnType<typeof getDb>, limit: numb
 export async function GET(request: Request) {
   // F-01 fix: раньше требовался ?secret=<SYNC_SECRET>, но переменная была не задана
   // и оба крона всегда падали 403. Теперь кроны авторизуются через x-vercel-cron.
-  if (!isCronAuthorized(request)) {
+  // Аудит 27.09.2026: + админ-сессия — чтобы watchdog/админка могли дёрнуть
+  // синк вручную (как это уже умеет creative-sync).
+  const user = await authFromRequest(request);
+  const isAdmin = !!user && user.role === 'admin';
+  if (!isCronAuthorized(request) && !isAdmin) {
     return NextResponse.json({ error: 'Forbidden' }, { status: 403 });
   }
 

@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server';
-import { getDb } from '@/lib/db';
+import { getDb, authFromRequest } from '@/lib/db';
 import { isCronAuthorized } from '@/lib/cron-auth';
 import { logEvent } from '@/lib/logger';
 import { notifyTelegram } from '@/lib/notify';
@@ -110,7 +110,10 @@ async function fetchXxxIgraDescription(gameUrl: string): Promise<string> {
 
 export async function GET(request: Request) {
   // F-01 fix: единая cron-авторизация (x-vercel-cron / Bearer CRON_SECRET / ?secret=...)
-  if (!isCronAuthorized(request)) {
+  // Аудит 27.09.2026: + админ-сессия — для watchdog/ручного запуска.
+  const user = await authFromRequest(request);
+  const isAdmin = !!user && user.role === 'admin';
+  if (!isCronAuthorized(request) && !isAdmin) {
     return NextResponse.json({ error: 'Forbidden' }, { status: 403 });
   }
 
