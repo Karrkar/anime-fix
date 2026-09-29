@@ -1,7 +1,7 @@
 'use client';
 
 import { useState, useEffect, useCallback } from 'react';
-import { Clock, ChevronLeft, RefreshCw, CheckCircle2, XCircle, Users, Wallet, Hourglass } from 'lucide-react';
+import { Clock, ChevronLeft, RefreshCw, CheckCircle2, XCircle, Users, Wallet, Hourglass, Ticket } from 'lucide-react';
 import { SkeletonCard } from '@/components/ui';
 import { Page } from '@/lib/client-types';
 import { apiFetch } from '@/lib/client-utils';
@@ -145,6 +145,187 @@ function SubscribersSection() {
 }
 
 
+// ─── Admin: промо-коды AP (генерация/листинг) ─────────────────────────────
+interface PromoRow {
+  code: string;
+  amountAp: number;
+  maxUses: number;
+  usedCount: number;
+  expiresAt: string | null;
+  isActive: boolean;
+  note: string | null;
+  createdAt: string;
+}
+
+function PromoSection() {
+  const [codes, setCodes] = useState<PromoRow[] | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState('');
+  const [forbidden, setForbidden] = useState(false);
+  // форма генерации
+  const [amount, setAmount] = useState('100');
+  const [count, setCount] = useState('5');
+  const [maxUses, setMaxUses] = useState('1');
+  const [expiryDays, setExpiryDays] = useState('30');
+  const [note, setNote] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [generated, setGenerated] = useState<string[]>([]);
+  const [genMsg, setGenMsg] = useState('');
+  const [copied, setCopied] = useState(false);
+
+  const load = useCallback(() => {
+    setLoading(true);
+    apiFetch<{ codes: PromoRow[] }>('/api/admin/promo')
+      .then(d => { setCodes(d.codes || []); setForbidden(false); setError(''); })
+      .catch(e => {
+        const m = String(e.message || e);
+        if (m.includes('403')) setForbidden(true);
+        else if (m.includes('404') || m.includes('PGRST')) { setForbidden(false); setCodes([]); setError('Таблицы промо-кодов ещё не созданы (SQL-миграция)'); }
+        else setError(m);
+      })
+      .finally(() => setLoading(false));
+  }, []);
+
+  useEffect(() => { load(); }, [load]);
+
+  const generate = useCallback(async () => {
+    setBusy(true); setGenMsg(''); setGenerated([]); setCopied(false);
+    try {
+      const d = await apiFetch<{ ok: boolean; codes: string[]; message: string }>('/api/admin/promo', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: 'generate',
+          amountAp: parseInt(amount, 10) || 0,
+          count: parseInt(count, 10) || 0,
+          maxUses: parseInt(maxUses, 10) || 1,
+          expiresInDays: expiryDays ? parseInt(expiryDays, 10) : null,
+          note,
+        }),
+      });
+      setGenerated(d.codes || []);
+      setGenMsg(d.message || 'Коды созданы');
+      load(); // обновить таблицу
+    } catch (e) {
+      setGenMsg('Ошибка: ' + String((e as Error).message || e));
+    }
+    setBusy(false);
+  }, [amount, count, maxUses, expiryDays, note, load]);
+
+  const copyAll = useCallback(() => {
+    if (!generated.length) return;
+    navigator.clipboard?.writeText(generated.join('\n')).then(() => {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    }).catch(() => {});
+  }, [generated]);
+
+  const deactivate = useCallback(async (code: string) => {
+    try {
+      await apiFetch('/api/admin/promo', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'deactivate', code }),
+      });
+      load();
+    } catch { /* молча */ }
+  }, [load]);
+
+  if (forbidden) return null;
+
+  return (
+    <div className="mb-6">
+      <div className="flex items-center justify-between mb-3">
+        <div>
+          <h2 className="text-lg font-bold flex items-center gap-2"><Ticket className="w-4 h-4 text-indigo-400" /> Промо-коды AP</h2>
+          <p className="text-xs text-[var(--muted-foreground)]">Подарочные коды на внутренний баланс (активируются в профиле)</p>
+        </div>
+        <button onClick={load} disabled={loading} className="p-2 rounded-lg bg-[var(--card)] border border-[var(--border)] hover:bg-[var(--muted)] disabled:opacity-50" title="Обновить">
+          <RefreshCw className={`w-4 h-4 ${loading ? 'animate-spin' : ''}`} />
+        </button>
+      </div>
+
+      {error && <div className="bg-amber-500/10 border border-amber-500/20 rounded-xl p-3 text-xs text-amber-400 mb-3">{error}</div>}
+
+      {/* Форма генерации */}
+      <div className="bg-[var(--card)] border border-[var(--border)] rounded-xl p-4 mb-3">
+        <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 mb-2">
+          <div>
+            <label className="text-[10px] text-[var(--muted-foreground)] block mb-1">Сумма, AP</label>
+            <input type="number" min={1} max={50000} value={amount} onChange={e => setAmount(e.target.value)}
+              className="w-full px-2.5 py-2 rounded-lg bg-[var(--muted)] border border-[var(--border)] text-sm focus:outline-none focus:border-indigo-500/50" />
+          </div>
+          <div>
+            <label className="text-[10px] text-[var(--muted-foreground)] block mb-1">Количество</label>
+            <input type="number" min={1} max={200} value={count} onChange={e => setCount(e.target.value)}
+              className="w-full px-2.5 py-2 rounded-lg bg-[var(--muted)] border border-[var(--border)] text-sm focus:outline-none focus:border-indigo-500/50" />
+          </div>
+          <div>
+            <label className="text-[10px] text-[var(--muted-foreground)] block mb-1">Активаций на код</label>
+            <input type="number" min={1} max={1000} value={maxUses} onChange={e => setMaxUses(e.target.value)}
+              className="w-full px-2.5 py-2 rounded-lg bg-[var(--muted)] border border-[var(--border)] text-sm focus:outline-none focus:border-indigo-500/50" />
+          </div>
+          <div>
+            <label className="text-[10px] text-[var(--muted-foreground)] block mb-1">Срок, дней</label>
+            <input type="number" min={0} max={365} value={expiryDays} onChange={e => setExpiryDays(e.target.value)} placeholder="∞"
+              className="w-full px-2.5 py-2 rounded-lg bg-[var(--muted)] border border-[var(--border)] text-sm focus:outline-none focus:border-indigo-500/50" />
+          </div>
+        </div>
+        <input type="text" value={note} onChange={e => setNote(e.target.value)} placeholder="Комментарий (для себя, напр. «розыгрыш в TG»)"
+          className="w-full px-3 py-2 rounded-lg bg-[var(--muted)] border border-[var(--border)] text-xs mb-2 focus:outline-none focus:border-indigo-500/50" />
+        <button onClick={generate} disabled={busy}
+          className="w-full py-2.5 rounded-xl text-sm font-medium bg-gradient-to-r from-indigo-500 to-violet-500 text-white hover:opacity-90 disabled:opacity-50 transition-all">
+          {busy ? 'Генерируем...' : 'Сгенерировать'}
+        </button>
+        {genMsg && <p className="text-xs text-center mt-2 text-[var(--muted-foreground)]">{genMsg}</p>}
+        {generated.length > 0 && (
+          <div className="mt-3">
+            <div className="flex items-center justify-between mb-1.5">
+              <p className="text-xs font-medium text-emerald-400">Новые коды:</p>
+              <button onClick={copyAll} className="text-[11px] px-2 py-1 rounded-lg bg-emerald-500/10 text-emerald-400 hover:bg-emerald-500/20 transition-colors">
+                {copied ? 'Скопировано ✓' : 'Копировать все'}
+              </button>
+            </div>
+            <div className="font-mono text-xs bg-[var(--muted)] rounded-lg p-2.5 max-h-32 overflow-y-auto space-y-0.5">
+              {generated.map(c => <div key={c} className="text-[var(--foreground)]">{c}</div>)}
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* Таблица кодов */}
+      {loading ? (
+        <div className="space-y-2">{Array.from({ length: 2 }, (_, i) => <SkeletonCard key={i} aspect="h-16" />)}</div>
+      ) : codes && codes.length > 0 ? (
+        <div className="space-y-1.5 max-h-96 overflow-y-auto">
+          {codes.map(c => (
+            <div key={c.code} className="bg-[var(--card)] border border-[var(--border)] rounded-xl px-3 py-2 flex items-center justify-between gap-2 flex-wrap">
+              <div className="flex items-center gap-2 min-w-0">
+                <span className="font-mono text-xs font-semibold">{c.code}</span>
+                <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-indigo-500/15 text-indigo-400 font-semibold flex-shrink-0">{c.amountAp} AP</span>
+                {!c.isActive && <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-red-500/15 text-red-400 font-semibold flex-shrink-0">погашен</span>}
+              </div>
+              <div className="flex items-center gap-2 text-[11px] text-[var(--muted-foreground)]">
+                <span>{c.usedCount}/{c.maxUses} исп.</span>
+                {c.expiresAt && <span>до {new Date(c.expiresAt).toLocaleDateString('ru-RU')}</span>}
+                {c.note && <span className="max-w-[140px] truncate hidden sm:inline" title={c.note}>«{c.note}»</span>}
+                {c.isActive && (
+                  <button onClick={() => deactivate(c.code)} className="text-[10px] px-1.5 py-0.5 rounded-lg bg-red-500/10 text-red-400 hover:bg-red-500/20 transition-colors">
+                    погасить
+                  </button>
+                )}
+              </div>
+            </div>
+          ))}
+        </div>
+      ) : !error && (
+        <p className="text-xs text-[var(--muted-foreground)] text-center py-3">Кодов пока нет — сгенерируйте первую пачку</p>
+      )}
+    </div>
+  );
+}
+
+
 // ─── Admin: статус синхронизаций (last sync) ─────────────────────────────
 export interface SyncStatusEntry {
   source: string;
@@ -229,6 +410,7 @@ export function AdminPage({ onBack, onNavigate }: { onBack: () => void; onNaviga
 
       {/* Подписчики: профили + подписки + платежи — только админ */}
       {!forbidden && <SubscribersSection />}
+      {!forbidden && <PromoSection />}
 
       {/* Ручная активация подписки (платежи мимо вебхука ЮMoney) — только админ */}
       {!forbidden && (

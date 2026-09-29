@@ -2,8 +2,18 @@
 
 import { useState, useEffect, useCallback, type FormEvent } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { User, X, Sparkles, AlertTriangle, RefreshCw, Eye, EyeOff } from 'lucide-react';
+import { User, X, Sparkles, AlertTriangle, RefreshCw, Eye, EyeOff, Wallet, Gift, Ticket, History as HistoryIcon, Plus } from 'lucide-react';
 import { Page } from '@/lib/client-types';
+
+interface BalanceTx {
+  id: number;
+  kind: 'topup' | 'redeem' | 'spend' | 'admin';
+  amountAp: number;
+  balanceAfter: number;
+  createdAt: string;
+}
+
+const TOPUP_PRESETS = [100, 250, 500, 1000];
 
 export function ProfilePage({ onSubscriptionChange, onNavigate }: { onSubscriptionChange: (active: boolean) => void; onNavigate: (p: Page) => void }) {
   // ── State ──
@@ -26,6 +36,22 @@ export function ProfilePage({ onSubscriptionChange, onNavigate }: { onSubscripti
   const [paymentOpened, setPaymentOpened] = useState(false); // оплата открыта в новой вкладке
   const [quickpayUrl, setQuickpayUrl] = useState<string | null>(null); // запасная quickpay-ссылка ЮMoney
 
+  // ── AP-баланс (внутренняя валюта, 1 AP = 1 ₽) ──
+  const [balance, setBalance] = useState<number | null>(null); // null = ещё не загрузили
+  const [balanceTx, setBalanceTx] = useState<BalanceTx[]>([]);
+  const [showHistory, setShowHistory] = useState(false);
+  const [showPromo, setShowPromo] = useState(false);
+  const [promoInput, setPromoInput] = useState('');
+  const [promoBusy, setPromoBusy] = useState(false);
+  const [promoMsg, setPromoMsg] = useState<{ ok: boolean; text: string } | null>(null);
+  const [showTopup, setShowTopup] = useState(false);
+  const [topupAmount, setTopupAmount] = useState('250');
+  const [topupBusy, setTopupBusy] = useState(false);
+  const [topupError, setTopupError] = useState('');
+  const [topupOpened, setTopupOpened] = useState(false);
+  const [topupDone, setTopupDone] = useState(false);
+  const [spendBusy, setSpendBusy] = useState(false);
+
   // F-07 fix: сессия живёт в httpOnly cookie. localStorage читается один раз
   // только для миграции: сервер проверит старый токен и выдаст cookie.
   useEffect(() => {
@@ -45,6 +71,7 @@ export function ProfilePage({ onSubscriptionChange, onNavigate }: { onSubscripti
         // Админ имеет полный бесплатный доступ к 18+ без подписки — раньше
         // свежелогиненный админ упирался в пейволл до перезагрузки страницы.
         onSubscriptionChange(d.user.role === 'admin' || !!d.user.subscription?.isActive);
+        loadBalance();
       } else {
         localStorage.removeItem('anime_platform_token');
         setToken('');
@@ -89,6 +116,126 @@ export function ProfilePage({ onSubscriptionChange, onNavigate }: { onSubscripti
     setPaymentOpened(false);
     setQuickpayUrl(null);
   }, []);
+
+  // ── AP-баланс: загрузка ──
+  const loadBalance = useCallback(() => {
+    fetch('/api/balance').then(r => r.ok ? r.json() : null).then(d => {
+      if (d && d.ok) {
+        setBalance(d.balance ?? 0);
+        setBalanceTx(d.transactions || []);
+      } else {
+        setBalance(null); // таблиц ещё нет (миграция не применена) — секция скрыта
+      }
+    }).catch(() => {});
+  }, []);
+
+  // ── промо-код: активация ──
+  const handleRedeem = useCallback(async () => {
+    if (!promoInput.trim()) return;
+    setPromoBusy(true);
+    setPromoMsg(null);
+    try {
+      const d = await fetch('/api/balance', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'redeem', code: promoInput.trim() }),
+      }).then(r => r.json());
+      if (d.ok) {
+        setPromoMsg({ ok: true, text: d.message || `+${d.amountAp} AP` });
+        setPromoInput('');
+        loadBalance();
+      } else {
+        setPromoMsg({ ok: false, text: d.error || 'Код не принят' });
+      }
+    } catch {
+      setPromoMsg({ ok: false, text: 'Ошибка подключения' });
+    }
+    setPromoBusy(false);
+  }, [promoInput, loadBalance]);
+
+  // ── оплата тарифа с баланса ──
+  const handleSpend = useCallback(async (planId: string) => {
+    setSpendBusy(true);
+    setPayError('');
+    try {
+      const d = await fetch('/api/balance', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'spend', planId }),
+      }).then(r => r.json());
+      if (d.ok) {
+        setBalance(d.balance ?? 0);
+        setPaymentDone(true);
+        setPayError('');
+        // подтягиваем свежую подписку
+        fetch('/api/subscription', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ action: 'confirm-payment' }),
+        }).then(r => r.json()).then(cd => {
+          if (cd.ok && cd.subscription) {
+            setSubscription(cd.subscription);
+            onSubscriptionChange(true);
+          }
+        }).catch(() => {});
+        loadBalance();
+      } else {
+        setPayError(d.error || 'Не удалось оплатить с баланса');
+      }
+    } catch {
+      setPayError('Ошибка подключения');
+    }
+    setSpendBusy(false);
+  }, [onSubscriptionChange, loadBalance]);
+
+  // ── пополнение: создать платёж и открыть ЮMoney ──
+  const handleTopupConfirm = useCallback(async () => {
+    const amount = parseInt(topupAmount, 10);
+    setTopupError('');
+    if (!Number.isFinite(amount) || amount < 50 || amount > 10000) {
+      setTopupError('Сумма: целое число от 50 до 10000 AP');
+      return;
+    }
+    setTopupBusy(true);
+    try {
+      const d = await fetch('/api/balance', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'topup', amountAp: amount }),
+      }).then(r => r.json());
+      if (d.ok && d.paymentUrl) {
+        setTopupOpened(true);
+        setTopupBusy(false);
+        const win = window.open(d.paymentUrl, '_blank');
+        if (win) win.opener = null;
+        else window.location.href = d.paymentUrl;
+        return;
+      }
+      setTopupError(d.error || 'Не удалось создать платёж');
+    } catch {
+      setTopupError('Ошибка подключения');
+    }
+    setTopupBusy(false);
+  }, [topupAmount]);
+
+  // авто-опрос баланса, пока открыта модалка пополнения (антипат подписки)
+  useEffect(() => {
+    if (!topupOpened || !showTopup) return;
+    let stopped = false;
+    const tick = async () => {
+      if (stopped) return;
+      try {
+        const d = await fetch('/api/balance').then(r => r.ok ? r.json() : null);
+        if (d && d.ok && typeof d.balance === 'number' && d.balance > (balance ?? 0)) {
+          setBalance(d.balance);
+          setBalanceTx(d.transactions || []);
+          setTopupDone(true);
+          setTopupOpened(false);
+          stopped = true;
+        }
+      } catch {}
+    };
+    const iv = setInterval(tick, 5000);
+    const onVis = () => { if (!document.hidden) tick(); };
+    document.addEventListener('visibilitychange', onVis);
+    return () => { stopped = true; clearInterval(iv); document.removeEventListener('visibilitychange', onVis); };
+  }, [topupOpened, showTopup, balance]);
 
   const handlePaymentConfirm = useCallback(async () => {
     if (!showPayment || !token) return;
@@ -320,6 +467,82 @@ export function ProfilePage({ onSubscriptionChange, onNavigate }: { onSubscripti
             </div>
           )}
 
+          {/* ── AP-баланс (внутренняя валюта, 1 AP = 1 ₽) ── */}
+          {balance !== null && (
+            <div className="bg-gradient-to-r from-indigo-500/10 to-violet-500/10 border border-indigo-500/20 rounded-xl p-4 mb-6">
+              <div className="flex items-center justify-between mb-3">
+                <div className="flex items-center gap-2">
+                  <Wallet className="w-4 h-4 text-indigo-400" />
+                  <span className="text-sm font-medium text-indigo-400">Баланс AP</span>
+                </div>
+                <button
+                  onClick={() => setShowHistory(v => !v)}
+                  className="flex items-center gap-1 text-xs text-[var(--muted-foreground)] hover:text-[var(--foreground)] transition-colors"
+                >
+                  <HistoryIcon className="w-3.5 h-3.5" />
+                  {showHistory ? 'Скрыть историю' : 'История'}
+                </button>
+              </div>
+              <div className="flex items-end justify-between gap-3 mb-3">
+                <div>
+                  <span className="text-3xl font-extrabold">{balance}</span>
+                  <span className="text-sm text-[var(--muted-foreground)] ml-1.5">AP</span>
+                  <p className="text-[11px] text-[var(--muted-foreground)] mt-0.5">1 AP = 1 ₽ — можно тратить на подписку</p>
+                </div>
+                <div className="flex gap-2 flex-shrink-0">
+                  <button
+                    onClick={() => { setShowTopup(true); setTopupDone(false); setTopupOpened(false); setTopupError(''); }}
+                    className="flex items-center gap-1 px-3 py-2 rounded-lg text-xs font-medium bg-indigo-500/15 text-indigo-400 hover:bg-indigo-500/25 transition-colors"
+                  >
+                    <Plus className="w-3.5 h-3.5" />Пополнить
+                  </button>
+                  <button
+                    onClick={() => { setShowPromo(v => !v); setPromoMsg(null); }}
+                    className="flex items-center gap-1 px-3 py-2 rounded-lg text-xs font-medium border border-[var(--border)] text-[var(--muted-foreground)] hover:text-[var(--foreground)] hover:border-indigo-500/40 transition-colors"
+                  >
+                    <Ticket className="w-3.5 h-3.5" />Промокод
+                  </button>
+                </div>
+              </div>
+              {showPromo && (
+                <div className="flex gap-2 mb-2">
+                  <input
+                    type="text" value={promoInput} onChange={e => setPromoInput(e.target.value.toUpperCase())}
+                    placeholder="AP-XXXXX-XXXXX" spellCheck={false} autoCapitalize="characters"
+                    className="flex-1 px-3 py-2 rounded-lg bg-[var(--card)] border border-[var(--border)] text-sm font-mono tracking-wide placeholder:text-[var(--muted-foreground)] focus:outline-none focus:border-indigo-500/50 transition-all"
+                    onKeyDown={e => { if (e.key === 'Enter') handleRedeem(); }}
+                  />
+                  <button
+                    onClick={handleRedeem} disabled={promoBusy || !promoInput.trim()}
+                    className="px-4 py-2 rounded-lg text-xs font-medium bg-gradient-to-r from-indigo-500 to-violet-500 text-white hover:opacity-90 transition-all disabled:opacity-50"
+                  >
+                    {promoBusy ? '...' : 'Активировать'}
+                  </button>
+                </div>
+              )}
+              {promoMsg && (
+                <p className={`text-xs mb-2 ${promoMsg.ok ? 'text-emerald-400' : 'text-red-400'}`}>{promoMsg.text}</p>
+              )}
+              {showHistory && (
+                <div className="border-t border-[var(--border)] pt-2 mt-1 max-h-52 overflow-y-auto">
+                  {balanceTx.length === 0 ? (
+                    <p className="text-xs text-[var(--muted-foreground)] py-2">Операций пока нет</p>
+                  ) : balanceTx.map(tx => (
+                    <div key={tx.id} className="flex items-center justify-between py-1.5 text-xs border-b border-[var(--border)]/50 last:border-0">
+                      <span className="text-[var(--muted-foreground)]">
+                        {tx.kind === 'topup' ? 'Пополнение' : tx.kind === 'redeem' ? 'Промокод' : tx.kind === 'spend' ? 'Подписка' : 'Начисление'}
+                        <span className="ml-1.5 opacity-60">{new Date(tx.createdAt).toLocaleString('ru-RU', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' })}</span>
+                      </span>
+                      <span className={`font-semibold ${tx.amountAp > 0 ? 'text-emerald-400' : 'text-red-400'}`}>
+                        {tx.amountAp > 0 ? '+' : ''}{tx.amountAp} AP
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+
           {/* Plans */}
           <div className="mb-4">
             <h2 className="text-base sm:text-lg font-bold mb-1">
@@ -433,6 +656,20 @@ export function ProfilePage({ onSubscriptionChange, onNavigate }: { onSubscripti
                     </div>
                   </div>
 
+                  {balance !== null && balance >= selectedPlan.price && (
+                    <button
+                      onClick={() => handleSpend(selectedPlan.id)}
+                      disabled={spendBusy || paymentDone}
+                      className="w-full py-3.5 rounded-xl font-semibold text-white bg-gradient-to-r from-indigo-500 to-violet-500 hover:opacity-90 transition-all shadow-lg shadow-indigo-500/20 disabled:opacity-50 active:scale-[0.98] text-sm mb-3"
+                    >
+                      {spendBusy ? 'Активируем...' : `Оплатить с баланса — ${selectedPlan.price} AP`}
+                    </button>
+                  )}
+                  {balance !== null && balance < selectedPlan.price && (
+                    <p className="text-[11px] text-center text-[var(--muted-foreground)] mb-3">
+                      На балансе {balance} AP — не хватает {selectedPlan.price - balance} AP для оплаты без карты
+                    </p>
+                  )}
                   <button
                     onClick={paymentOpened ? recheckSubscription : handlePaymentConfirm}
                     disabled={subscribing || checkingPayment}
@@ -488,6 +725,103 @@ export function ProfilePage({ onSubscriptionChange, onNavigate }: { onSubscripti
                   <button
                     onClick={() => { setShowPayment(null); setPayError(''); }}
                     disabled={subscribing}
+                    className="w-full py-2.5 mt-2 rounded-xl text-sm text-[var(--muted-foreground)] hover:text-[var(--foreground)] transition-colors disabled:opacity-50"
+                  >
+                    Отмена
+                  </button>
+                </>
+              )}
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* ── Topup Modal (пополнение AP-баланса) ── */}
+      <AnimatePresence>
+        {showTopup && (
+          <motion.div
+            initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
+            className="fixed inset-0 z-[200] bg-black/80 backdrop-blur-sm flex items-center justify-center p-4"
+            onClick={() => { if (!topupBusy && !topupDone) { setShowTopup(false); } }}
+          >
+            <motion.div
+              initial={{ scale: 0.9, y: 20 }} animate={{ scale: 1, y: 0 }} exit={{ scale: 0.9, y: 20 }}
+              className="bg-[var(--card)] border border-[var(--border)] rounded-2xl p-6 sm:p-8 max-w-sm w-full"
+              onClick={e => e.stopPropagation()}
+            >
+              {topupDone ? (
+                <div className="text-center py-4">
+                  <div className="w-16 h-16 rounded-full bg-indigo-500/15 flex items-center justify-center mx-auto mb-4">
+                    <Wallet className="w-8 h-8 text-indigo-400" />
+                  </div>
+                  <h3 className="text-lg font-bold mb-2">Баланс пополнен!</h3>
+                  <p className="text-sm text-[var(--muted-foreground)]">Текущий баланс: {balance} AP</p>
+                  <button
+                    onClick={() => { setShowTopup(false); setTopupDone(false); }}
+                    className="w-full py-2.5 mt-5 rounded-xl text-sm font-medium bg-gradient-to-r from-indigo-500 to-violet-500 text-white hover:opacity-90 transition-all"
+                  >
+                    Готово
+                  </button>
+                </div>
+              ) : (
+                <>
+                  <div className="flex items-center gap-2 mb-1">
+                    <Wallet className="w-4 h-4 text-indigo-400" />
+                    <h3 className="text-lg font-bold">Пополнение баланса</h3>
+                  </div>
+                  <p className="text-sm text-[var(--muted-foreground)] mb-5">1 AP = 1 ₽ — пополняйте один раз, платите за подписки без карты</p>
+
+                  <div className="grid grid-cols-4 gap-2 mb-3">
+                    {TOPUP_PRESETS.map(v => (
+                      <button
+                        key={v}
+                        onClick={() => setTopupAmount(String(v))}
+                        className={`py-2.5 rounded-lg text-sm font-semibold transition-all ${topupAmount === String(v)
+                          ? 'bg-indigo-500/20 text-indigo-400 border border-indigo-500/50'
+                          : 'bg-[var(--muted)] text-[var(--muted-foreground)] hover:text-[var(--foreground)] border border-transparent'}`}
+                      >
+                        {v}
+                      </button>
+                    ))}
+                  </div>
+                  <div className="flex items-center gap-2 mb-4">
+                    <input
+                      type="number" min={50} max={10000} value={topupAmount}
+                      onChange={e => setTopupAmount(e.target.value)}
+                      className="flex-1 px-4 py-3 rounded-xl bg-[var(--card)] border border-[var(--border)] text-sm focus:outline-none focus:border-indigo-500/50 transition-all"
+                    />
+                    <span className="text-sm font-semibold text-[var(--muted-foreground)]">AP</span>
+                  </div>
+
+                  <div className="bg-[var(--muted)] rounded-xl p-4 space-y-2 mb-5">
+                    <div className="flex items-center justify-between text-sm">
+                      <span className="text-[var(--muted-foreground)]">К оплате</span>
+                      <span className="text-xl font-bold">{topupAmount || 0} ₽</span>
+                    </div>
+                    <p className="text-xs text-[var(--muted-foreground)] leading-relaxed">
+                      Откроется страница ЮMoney (SberPay / карта / кошелёк).
+                      После оплаты AP зачислятся автоматически — обычно 1–2 минуты.
+                    </p>
+                  </div>
+
+                  {topupOpened && (
+                    <p className="flex items-center justify-center gap-1.5 text-xs text-emerald-400 mb-3">
+                      <RefreshCw className="w-3 h-3 animate-spin" />
+                      Ждём оплату — зачисление произойдёт автоматически
+                    </p>
+                  )}
+                  {topupError && <p className="text-xs text-red-400 mb-3 text-center">{topupError}</p>}
+
+                  <button
+                    onClick={handleTopupConfirm}
+                    disabled={topupBusy}
+                    className="w-full py-3.5 rounded-xl font-semibold text-white bg-gradient-to-r from-indigo-500 to-violet-500 hover:opacity-90 transition-all shadow-lg shadow-indigo-500/20 disabled:opacity-50 active:scale-[0.98] text-sm"
+                  >
+                    {topupBusy ? 'Создаём платёж...' : topupOpened ? 'Открыть оплату ещё раз' : `Пополнить на ${topupAmount || 0} AP`}
+                  </button>
+                  <button
+                    onClick={() => { setShowTopup(false); setTopupError(''); }}
+                    disabled={topupBusy}
                     className="w-full py-2.5 mt-2 rounded-xl text-sm text-[var(--muted-foreground)] hover:text-[var(--foreground)] transition-colors disabled:opacity-50"
                   >
                     Отмена

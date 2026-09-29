@@ -3,6 +3,8 @@ import { getUserByEmail, activateSubscription, getDb } from '@/lib/db';
 import { withRateLimit } from '@/lib/with-rate-limit';
 import { getPlanById, PLANS } from '@/lib/plans';
 import { logEvent, maskEmail } from '@/lib/logger';
+import { creditBalance, parseTopupLabel } from '@/lib/balance';
+import { notifyTelegram } from '@/lib/notify';
 import crypto from 'crypto';
 
 /**
@@ -24,6 +26,10 @@ import crypto from 'crypto';
  *     приходит уведомление без label — вебхук берёт САМЫЙ СВЕЖИЙ PENDING-интент
  *     с той же суммой за последние 24 часа и активирует подписку его владельцу.
  *     Цены тарифов уникальны (100/250/500/1000 ₽) → коллизий практически нет.
+ *
+ * ПЛЮС ПУТЬ 3 (баланс AP): label вида topup_{userId}_{ts} — пополнение
+ *     внутреннего баланса (1 AP = 1 ₽). Матчинг по label из PENDING-интента
+ *     → атомарное начисление RPC ap_credit → уведомление в Telegram.
  *
  * Безопасность:
  *  - SHA-1 по официальной схеме p2p-incoming (constant-time сравнение)
@@ -181,7 +187,64 @@ async function yoomoneyNotifyHandler(request: NextRequest) {
 
     const opId = operation_id || 'PAID';
 
-    // ── 5. ПУТЬ 1: label задан (quickpay-ссылка) ───────────────────────
+    // ── 5. ПУТЬ 3: label topup_<userId>_<ts> — пополнение AP-баланса ────
+    if (label && label.startsWith('topup_')) {
+      const parsedTopup = parseTopupLabel(label);
+      if (!parsedTopup) {
+        console.error('YooMoney webhook: invalid topup label format', label);
+        return new NextResponse('Invalid label', { status: 400 });
+      }
+      const ap = Math.round(paid); // 1 AP = 1 ₽; копейки — в пользу платформы
+      if (ap <= 0) {
+        console.error('YooMoney webhook: topup amount too small', amount);
+        return new NextResponse('Bad amount', { status: 400 });
+      }
+
+      // PENDING-интент пополнения (создаётся /api/balance topup)
+      const { data: intent } = await db
+        .from('payments')
+        .select('id, user_id, operation_id')
+        .eq('payment_label', label)
+        .maybeSingle();
+
+      if (intent) {
+        if (intent.operation_id && intent.operation_id !== 'PENDING') {
+          console.log(`YooMoney webhook: duplicate topup ${label}, skipping`);
+          return new NextResponse('OK (duplicate)', { status: 200 });
+        }
+        await db.from('payments').update({ operation_id: opId }).eq('id', intent.id);
+      } else {
+        // Интент не нашли (напр. истёк/затёрт) — label сам содержит userId,
+        // а подпись SHA-1 гарантиает, что label не подделан: начисляем по нему.
+        const { error: payErr } = await db.from('payments').insert({
+          user_id: parsedTopup.userId,
+          amount: paid,
+          payment_label: label,
+          operation_id: opId,
+        });
+        if (payErr) {
+          console.error('YooMoney webhook: failed to record topup payment', payErr);
+          return new NextResponse('Payment record failed', { status: 500 });
+        }
+      }
+
+      try {
+        const newBalance = await creditBalance(parsedTopup.userId, ap, 'topup', {
+          via: 'webhook', operationId: opId, amountRub: paid,
+        });
+        logEvent('webhook_topup', { userId: parsedTopup.userId, ap, amount, newBalance, label });
+        void notifyTelegram(`💰 Пополнение баланса: +${ap} AP (${amount} ₽)\nБаланс после: ${newBalance} AP`);
+        return new NextResponse('OK', { status: 200 });
+      } catch (e) {
+        // ap_credit RPC нет (миграция не применена) или ошибка БД —
+        // платёж записан, но не начислен: 500 → ЮMoney ретраит уведомление,
+        // после применения миграции начисление пройдёт.
+        console.error('YooMoney webhook: topup credit failed', e);
+        return new NextResponse('Credit failed', { status: 500 });
+      }
+    }
+
+    // ── 6. ПУТЬ 1: label задан (quickpay-ссылка) ───────────────────────
     if (label && label.startsWith('ap_')) {
       const parsed = parseLabel(label);
       if (!parsed) {
@@ -253,13 +316,36 @@ async function yoomoneyNotifyHandler(request: NextRequest) {
       return new NextResponse('OK', { status: 200 });
     }
 
-    // ── 6. ПУТЬ 2: label пустой (персональная страница /to/) ───────────
+    // ── 7. ПУТЬ 2: label пустой (персональная страница /to/) ───────────
     // Матчинг: самый свежий PENDING-интент с той же суммой за 24 часа.
     const pending = await findPendingIntent(db, paid);
     if (!pending) {
       // Платёж реальный, но сопоставить некому — НЕ отдаём ошибку, чтобы
       // ЮMoney не ретраил впустую; администратор увидит запись в логах.
       logEvent('webhook_unmatched', { amount: paid, operationId: operation_id || '—' }, 'warn');
+      return new NextResponse('OK (unmatched)', { status: 200 });
+    }
+
+    // Интент пополнения баланса (topup_) без label: пополняем баланс владельцу
+    if (pending.payment_label && pending.payment_label.startsWith('topup_')) {
+      const pt = parseTopupLabel(pending.payment_label);
+      const ap = Math.round(paid);
+      if (pt && ap > 0) {
+        await db.from('payments').update({ operation_id: opId }).eq('id', pending.id);
+        try {
+          const newBalance = await creditBalance(pt.userId, ap, 'topup', {
+            via: 'webhook-amount-match', operationId: opId, amountRub: paid,
+          });
+          logEvent('webhook_topup', { via: 'amount-match', userId: pt.userId, ap, amount, newBalance });
+          void notifyTelegram(`💰 Пополнение баланса: +${ap} AP (${amount} ₽)\nБаланс после: ${newBalance} AP`);
+        } catch (e) {
+          console.error('YooMoney webhook: topup credit (amount-match) failed', e);
+          return new NextResponse('Credit failed', { status: 500 });
+        }
+        return new NextResponse('OK', { status: 200 });
+      }
+      // Битый topup-label в интенте — не матчим на тариф ниже
+      logEvent('webhook_unmatched', { amount: paid, reason: 'bad_topup_intent', operationId: operation_id || '—' }, 'warn');
       return new NextResponse('OK (unmatched)', { status: 200 });
     }
 

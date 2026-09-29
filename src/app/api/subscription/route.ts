@@ -5,6 +5,7 @@ import { getClientIp } from '@/lib/rate-limit';
 import { sanitizeEmail, validatePassword, validatePasswordStrict, validatePlanId } from '@/lib/validate';
 import { PLANS, Plan } from '@/lib/plans';
 import { logEvent, maskEmail } from '@/lib/logger';
+import { buildYooMoneyUrl as buildYooMoneyUrlShared, buildTransferUrl as buildTransferUrlShared, getSuccessUrl as getSuccessUrlShared } from '@/lib/yoomoney';
 
 // F-07 fix: сессия живёт в httpOnly cookie (недоступна JS -> не крадётся при XSS).
 // Bearer-токен в теле запроса остаётся как legacy-мост на время миграции.
@@ -23,83 +24,21 @@ function tokenFromBodyOrCookie(request: NextRequest, body: Record<string, unknow
 }
 
 // ─── YooMoney payment URL builder ────────────────────────────────────────
+// Билдеры вынесены в @/lib/yoomoney (их использует и /api/balance —
+// пополнение AP-баланса). Здесь — обёртки под сигнатуры этого роута.
+// F-02 fix сохранён: приоритет YOO_MONEY_RECEIVER, фолбэк YOO_MONEY_WALLET,
+// формат кошелька 11–16 цифр; quickpay-form=button + SUM по актуальной доке.
 
-/**
- * F-02 fix: в проекте задана переменная YOO_MONEY_RECEIVER, а код читал
- * YOO_MONEY_WALLET -> в платёжной ссылке уходил пустой receiver, и оплата
- * была невозможна в принципе. Теперь читаем обе (RECEIVER приоритетнее)
- * и проверяем формат кошелька ЮMoney (11–16 цифр, обычно 41001...).
- */
-function getReceiverWallet(): string {
-  const raw = process.env.YOO_MONEY_RECEIVER || process.env.YOO_MONEY_WALLET || '';
-  const receiver = raw.trim();
-  if (!/^\d{11,16}$/.test(receiver)) return '';
-  return receiver;
-}
-
-/**
- * «Перевод по кнопке» (quickpay) — ОСНОВНАЯ платёжная ссылка.
- *
- * ИСТОРИЯ ФИКСА: до сентября 2026 ссылка строилась с устаревшими параметрами
- * quickpay-form=shop + amount= — и ЮMoney отдавала ошибку
- * «Перевести не получится» (transfer/quickpay/error?reason=default) даже после
- * идентификации кошелька. По АКТУАЛЬНОЙ доке (yoomoney.ru/docs/payment-buttons)
- * форма принимает quickpay-form=button и сумму в параметре SUM (не amount!),
- * параметр targets у button-формы не существует. С правильными параметрами
- * форма открывается: показывает сумму тарифа и способы оплаты
- * (SberPay / банковская карта / кошелёк ЮMoney), проверено в браузере.
- *
- * label (до 64 символов — наш ap_... укладывается) передаётся в вебхук,
- * что даёт ТОЧНЫЙ матчинг платежа и пользователя (см. yoomoney-notify).
- * successURL возвращает пользователя на сайт после оплаты — там его подхватит
- * авто-опрос статуса подписки.
- */
-/**
- * Домен, на котором пользователь оформляет подписку (для successURL ЮMoney).
- * Берём из заголовков запроса — платёж возвращает человека на ТОТ ЖЕ домен,
- * с которого он платил (animeplatforma-new.online / anime-fix.vercel.app / …),
- * а не на захардкоженный. 09.2026: при переезде на собственный домен жёстко
- * зашитый successURL ломал возврат после оплаты (ссылки менялись).
- */
 function getSuccessUrl(request: NextRequest): string {
-  const host = request.headers.get('x-forwarded-host') || request.headers.get('host') || 'animeplatforma-new.online';
-  const proto = request.headers.get('x-forwarded-proto') || 'https';
-  return `${proto}://${host}/`;
+  return getSuccessUrlShared(request.headers.get('x-forwarded-host') || request.headers.get('host'), request.headers.get('x-forwarded-proto'));
 }
 
 function buildYooMoneyUrl(plan: Plan, label: string, successUrl: string): string | null {
-  const receiver = getReceiverWallet();
-  if (!receiver) return null;
-  const params = new URLSearchParams({
-    receiver,
-    'quickpay-form': 'button',
-    'paymentType': 'AC',
-    sum: String(plan.price),
-    label: label.slice(0, 64),
-    successURL: successUrl,
-  })
-  return `https://yoomoney.ru/quickpay/confirm?${params.toString()}`
+  return buildYooMoneyUrlShared(plan.price, label, successUrl);
 }
 
-/**
- * Запасная ссылка: персональная страница перевода ЮMoney (yoomoney.ru/to/КОШЕЛЕК).
- *
- * Используется, только если «Перевод по кнопке» (buildYooMoneyUrl) вдруг
- * не открылся. Страница /to/ открывается у всех (проверено из зарубежного IP),
- * НО игнорирует любые query-параметры — сумма НЕ подставляется, пользователь
- * вводит её вручную (в модалке оплаты мы подсказываем нужную сумму).
- * label через неё не передать — матчинг делает вебхук по PENDING-интенту,
- * созданному при subscribe, и уникальной сумме тарифа (см. yoomoney-notify).
- */
 function buildTransferUrl(plan: Plan): string | null {
-  const receiver = getReceiverWallet();
-  if (!receiver) return null;
-  // Параметр amount оставляем: не мешает, а на мобильных клиентах ЮMoney
-  // иногда подхватывается.
-  const params = new URLSearchParams({
-    amount: String(plan.price),
-  })
-  return `https://yoomoney.ru/to/${receiver}?${params.toString()}`
+  return buildTransferUrlShared(plan.price);
 }
 
 // ─── POST /api/subscription ─────────────────────────────────────────────
