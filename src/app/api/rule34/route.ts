@@ -20,7 +20,8 @@ interface ParsedPost {
 
 const PER_PAGE = 42;
 
-const ARTIST_TAGS = ['arzagod', 'balecxi', 'kaistar', 'kinkimya', 'rognezart', 'hypet', 'backdoorsenpai', 'milfhunter228'];
+// 2026-10-01: +6 авторов (futarush, kiraamane, aliusnext, meitabuu, maldo, duxvector)
+const ARTIST_TAGS = ['arzagod', 'balecxi', 'kaistar', 'kinkimya', 'rognezart', 'hypet', 'backdoorsenpai', 'milfhunter228', 'futarush', 'kiraamane', 'aliusnext', 'meitabuu', 'maldo', 'duxvector'];
 
 const CACHE_TTL = 5 * 60_000;
 

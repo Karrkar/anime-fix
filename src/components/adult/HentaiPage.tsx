@@ -461,7 +461,7 @@ export function HentaiPage({ onOpen, favorites, onNavigate, toggleFav, hasSubscr
           </div>
           {/* Quick filter tags - scrollable on mobile */}
           <div className="flex gap-1.5 overflow-x-auto pb-3 -mx-4 px-4 sm:mx-0 sm:px-0 sm:flex-wrap sm:overflow-visible">
-            {[{ tag: 'arzagod', label: 'Arzagod' }, { tag: 'balecxi', label: 'Balecxi' }, { tag: 'kaistar', label: 'Kaistar' }, { tag: 'kinkimya', label: 'Kinkimya' }, { tag: 'rognezart', label: 'Rognezart' }, { tag: 'hypet', label: 'Hypet' }, { tag: 'backdoorsenpai', label: 'Backdoorsenpai' }, { tag: 'milfhunter228', label: 'Milfhunter228' }, { tag: 'all', label: 'Все художники' }].map(t => (
+            {[{ tag: 'arzagod', label: 'Arzagod' }, { tag: 'balecxi', label: 'Balecxi' }, { tag: 'kaistar', label: 'Kaistar' }, { tag: 'kinkimya', label: 'Kinkimya' }, { tag: 'rognezart', label: 'Rognezart' }, { tag: 'hypet', label: 'Hypet' }, { tag: 'backdoorsenpai', label: 'Backdoorsenpai' }, { tag: 'milfhunter228', label: 'Milfhunter228' }, { tag: 'futarush', label: 'Futarush' }, { tag: 'kiraamane', label: 'Kiraamane' }, { tag: 'aliusnext', label: 'Aliusnext' }, { tag: 'meitabuu', label: 'Meitabuu' }, { tag: 'maldo', label: 'Maldo' }, { tag: 'duxvector', label: 'Duxvector' }, { tag: 'all', label: 'Все художники' }].map(t => (
               <button
                 key={t.tag}
                 onClick={() => { setArtsTags(t.tag); setArtsSearch(t.tag === 'all' ? '' : t.tag); setArtsPage(1); }}
