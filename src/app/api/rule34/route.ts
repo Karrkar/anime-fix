@@ -1,10 +1,18 @@
 // F-23 fix: убран runtime = 'edge' — платформа объявила Edge Runtime устаревшим,
 // роут работает на стандартном Node.js-рантайме (API совместимы).
+// 2026-10-03 fix «пропавшие авторы»: r.jina.ai блокирует анонимные запросы
+// с датацентровых IP (~40-50% отказов с Vercel) — арты arzagod/kaistar и др.
+// «пропадали», а частичный агрегат кэшировался как полный. Лечение:
+// fetchSourcePage с ретраями и валидацией HTML (lib/r34-fetch), чанкование
+// агрегата, stale-кэш последнего успеха, честные 502 вместо фейковых «пусто».
 import { NextResponse } from 'next/server';
 import { checkAdultAccess } from '@/lib/adult-access'; // 18+ = возраст + подписка
 import { BoundedTTLCache } from '@/lib/cache';
 import { logEvent } from '@/lib/logger';
-import { R34_BASE, JINA_READER } from '@/lib/sources'; // F-27: домены из единого реестра
+import { R34_BASE } from '@/lib/sources'; // F-27: домены из единого реестра
+import { fetchSourcePage, isListPageUsable, sleep } from '@/lib/r34-fetch';
+
+export const maxDuration = 60;
 
 interface ParsedPost {
   id: string;
@@ -26,7 +34,12 @@ const ARTIST_TAGS = ['arzagod', 'balecxi', 'kaistar', 'kinkimya', 'rognezart', '
 const CACHE_TTL = 5 * 60_000;
 
 // F-20 fix: кэш ограничен (LRU + TTL) — раньше Map рос без границ в edge-инстансе
-const cache = new BoundedTTLCache<string, { data: { posts: ParsedPost[]; totalPages: number; totalPosts: number }; ts: number }>(100, CACHE_TTL);
+const cache = new BoundedTTLCache<string, { posts: ParsedPost[]; totalPages: number; totalPosts: number }>(100, CACHE_TTL);
+
+// 2026-10-03: stale-кэш последнего УСПЕШНОГО результата (горизонт 6ч) —
+// страховка от фейков: если источник отказал, отдаём последнее живое,
+// а не молчаливый ноль
+const stale = new BoundedTTLCache<string, { posts: ParsedPost[]; totalPages: number; totalPosts: number }>(400, 6 * 60 * 60_000);
 
 // In-memory rate limit (per-IP, 20 req/min) — работает и на Node-рантайме
 const rlBuckets = new Map<string, number[]>();
@@ -95,46 +108,74 @@ function parseListPage(html: string, searchTag: string): { posts: ParsedPost[]; 
   return { posts, totalPages, totalPosts };
 }
 
-function fetchViaJina(targetUrl: string): Promise<string> {
-  const encoded = JINA_READER + encodeURIComponent(targetUrl);
-  return fetch(encoded, {
-    headers: { 'Accept': 'text/html', 'X-Return-Format': 'html', 'X-No-Cache': 'true' },
-    signal: AbortSignal.timeout(30000),
-  }).then(r => {
-    if (!r.ok) throw new Error(`fetch failed`);
-    return r.text();
+type ParsedList = { posts: ParsedPost[]; totalPages: number; totalPosts: number };
+
+/** Загрузка одной страницы-списка. mode 'full' — для одиночного тега
+ *  (3 попытки Jina + прямой), 'fast' — для агрегата (1 попытка, чанками). */
+async function fetchListPage(targetUrl: string, mode: 'full' | 'fast'): Promise<{ html: string; empty: boolean }> {
+  const html = await fetchSourcePage(targetUrl, {
+    validate: isListPageUsable,
+    jinaAttempts: mode === 'full' ? 3 : 1,
+    tryDirect: mode === 'full',
+    timeoutMs: 12_000,
   });
+  // страница валидна: есть thumb-ы → контент; есть только «chickens» → тег честно пуст
+  return { html, empty: !html.includes('class="thumb"') };
 }
 
-async function fetchAllArtists(pid: number): Promise<{ posts: ParsedPost[]; totalPages: number; totalPosts: number }> {
-  const results = await Promise.allSettled(
-    ARTIST_TAGS.map(async (tag) => {
-      const url = `${R34_BASE}/index.php?page=post&s=list&tags=${encodeURIComponent(tag)}&pid=${pid}`;
-      const html = await fetchViaJina(url);
-      return parseListPage(html, tag);
-    })
-  );
-
+async function fetchAllArtists(pid: number): Promise<ParsedList & { coverage: number }> {
   const allPosts: ParsedPost[] = [];
   let maxTotalPages = 1;
   let totalPosts = 0;
+  let okTags = 0;
+  let staleTags = 0;
   const seenIds = new Set<string>();
 
-  for (const r of results) {
-    if (r.status === 'fulfilled') {
-      for (const p of r.value.posts) {
-        if (!seenIds.has(p.id)) {
-          seenIds.add(p.id);
-          allPosts.push(p);
-        }
+  const merge = (parsed: ParsedList) => {
+    for (const p of parsed.posts) {
+      if (!seenIds.has(p.id)) {
+        seenIds.add(p.id);
+        allPosts.push(p);
       }
-      totalPosts += r.value.totalPosts;
-      if (r.value.totalPages > maxTotalPages) maxTotalPages = r.value.totalPages;
     }
+    totalPosts += parsed.totalPosts;
+    if (parsed.totalPages > maxTotalPages) maxTotalPages = parsed.totalPages;
+  };
+
+  // 2026-10-03: вместо 14 параллельных запросов (пакет как раз и ловил блок)
+  // — чанки по 5 с паузами; отказавший тег добираем из stale-кэша
+  const CHUNK = 5;
+  for (let i = 0; i < ARTIST_TAGS.length; i += CHUNK) {
+    const chunkTags = ARTIST_TAGS.slice(i, i + CHUNK);
+    const settled = await Promise.allSettled(
+      chunkTags.map(async (tag) => {
+        const url = `${R34_BASE}/index.php?page=post&s=list&tags=${encodeURIComponent(tag)}&pid=${pid}`;
+        const { html, empty } = await fetchListPage(url, 'fast');
+        return { tag, empty, parsed: empty ? null : parseListPage(html, tag) };
+      })
+    );
+    settled.forEach((r, idx) => {
+      const tag = chunkTags[idx];
+      if (r.status === 'fulfilled' && r.value.parsed) {
+        okTags++;
+        stale.set(`${tag}:${pid}`, r.value.parsed);
+        merge(r.value.parsed);
+      } else if (r.status === 'rejected') {
+        // источник отказал — последнее живое вместо молчаливого пропуска автора
+        const st = stale.get(`${tag}:${pid}`);
+        if (st && st.posts.length > 0) {
+          staleTags++;
+          merge(st);
+        }
+        logEvent('r34_tag_fail', { tag, pid, err: String(r.reason).slice(0, 120) });
+      }
+      // «честно пустой» тег (chickens) — ничего не делаем
+    });
+    if (i + CHUNK < ARTIST_TAGS.length) await sleep(400);
   }
 
   allPosts.sort((a, b) => b.score - a.score);
-  return { posts: allPosts, totalPages: maxTotalPages, totalPosts };
+  return { posts: allPosts, totalPages: maxTotalPages, totalPosts, coverage: (okTags + staleTags) / ARTIST_TAGS.length };
 }
 
 export async function GET(request: Request) {
@@ -163,42 +204,74 @@ export async function GET(request: Request) {
   if (tags === 'all' || tags === '') {
     const cacheKey = `all:${pid}`;
     const cached = cache.get(cacheKey);
-    if (cached && Date.now() - cached.ts < CACHE_TTL) {
+    if (cached) {
       return NextResponse.json({
-        posts: cached.data.posts, total: cached.data.totalPosts,
-        page, totalPages: cached.data.totalPages, tags: 'all',
+        posts: cached.posts, total: cached.totalPosts,
+        page, totalPages: cached.totalPages, tags: 'all',
       });
     }
     try {
-      const { posts, totalPages, totalPosts } = await fetchAllArtists(pid);
-      cache.set(cacheKey, { data: { posts, totalPages, totalPosts }, ts: Date.now() });
-      return NextResponse.json({ posts, total: totalPosts, page, totalPages, tags: 'all' });
+      const fresh = await fetchAllArtists(pid);
+      const st = stale.get(cacheKey);
+      // покрытие ≥75% — кэшируем как полный; хуже — не кэшируем фрагмент,
+      // но отдаём лучший из (фрагмент, stale) вариантов
+      if (fresh.coverage >= 0.75 || !st || st.posts.length <= fresh.posts.length) {
+        if (fresh.coverage >= 0.75) {
+          cache.set(cacheKey, fresh);
+          stale.set(cacheKey, fresh);
+        }
+        if (fresh.posts.length === 0) {
+          return NextResponse.json(
+            { error: 'Source unavailable', posts: [], total: 0, page, totalPages: 0, tags: 'all' },
+            { status: 502 }
+          );
+        }
+        return NextResponse.json({ posts: fresh.posts, total: fresh.totalPosts, page, totalPages: fresh.totalPages, tags: 'all' });
+      }
+      return NextResponse.json({ posts: st.posts, total: st.totalPosts, page, totalPages: st.totalPages, tags: 'all' });
     } catch {
-      return NextResponse.json({ error: 'Failed to load', posts: [], total: 0, page: 1, totalPages: 0, tags: 'all' });
+      const st = stale.get(cacheKey);
+      if (st) {
+        return NextResponse.json({ posts: st.posts, total: st.totalPosts, page, totalPages: st.totalPages, tags: 'all' }, { headers: { 'X-Data-Stale': '1' } });
+      }
+      return NextResponse.json({ error: 'Source unavailable', posts: [], total: 0, page, totalPages: 0, tags: 'all' }, { status: 502 });
     }
   }
 
   const cacheKey = `${tags}:${pid}`;
   const cached = cache.get(cacheKey);
-  if (cached && Date.now() - cached.ts < CACHE_TTL) {
+  if (cached) {
     return NextResponse.json({
-      posts: cached.data.posts, total: cached.data.totalPosts,
-      page, totalPages: cached.data.totalPages, tags,
+      posts: cached.posts, total: cached.totalPosts,
+      page, totalPages: cached.totalPages, tags,
     });
   }
 
   try {
     const targetUrl = `${R34_BASE}/index.php?page=post&s=list&tags=${encodeURIComponent(tags)}&pid=${pid}`;
-    const html = await fetchViaJina(targetUrl);
-    const { posts, totalPages, totalPosts } = parseListPage(html, tags);
+    const { html, empty } = await fetchListPage(targetUrl, 'full');
 
-    if (posts.length === 0) {
+    if (empty) {
+      // честно пустой тег («Nobody here but us chickens») — не ошибка и не кэш
       return NextResponse.json({ posts: [], total: 0, page, totalPages: 0, tags });
     }
 
-    cache.set(cacheKey, { data: { posts, totalPages, totalPosts }, ts: Date.now() });
-    return NextResponse.json({ posts, total: totalPosts, page, totalPages, tags });
-  } catch {
-    return NextResponse.json({ error: 'Failed to load', posts: [], total: 0, page: 1, totalPages: 0, tags });
+    const parsed = parseListPage(html, tags);
+    if (parsed.posts.length === 0) {
+      return NextResponse.json({ posts: [], total: 0, page, totalPages: 0, tags });
+    }
+
+    cache.set(cacheKey, parsed);
+    stale.set(cacheKey, parsed);
+    return NextResponse.json({ posts: parsed.posts, total: parsed.totalPosts, page, totalPages: parsed.totalPages, tags });
+  } catch (e) {
+    // все попытки отказали: отдаём последнее живое (stale), иначе честный 502 —
+    // раньше здесь возвращался фейковый «пустой» ответ, и авторы «пропадали»
+    logEvent('r34_fetch_fail', { tags, pid, err: String(e).slice(0, 120) });
+    const st = stale.get(cacheKey);
+    if (st) {
+      return NextResponse.json({ posts: st.posts, total: st.totalPosts, page, totalPages: st.totalPages, tags }, { headers: { 'X-Data-Stale': '1' } });
+    }
+    return NextResponse.json({ error: 'Source unavailable', posts: [], total: 0, page, totalPages: 0, tags }, { status: 502 });
   }
 }

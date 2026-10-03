@@ -1,10 +1,13 @@
 // F-23 fix: убран runtime = 'edge' — Edge Runtime объявлен платформой устаревшим,
 // роут работает на стандартном Node.js-рантайме (API совместимы).
+// 2026-10-03: переход на lib/r34-fetch — ретраи + валидация HTML + опциональный
+// JINA_API_KEY (r.jina.ai блокирует анонимные датацентровые IP ~40-50% запросов)
 import { NextResponse } from 'next/server';
 import { checkAdultAccess } from '@/lib/adult-access'; // 18+ = возраст + подписка
 import { BoundedTTLCache } from '@/lib/cache';
 import { logEvent } from '@/lib/logger';
-import { R34_BASE, JINA_READER } from '@/lib/sources'; // F-27: домены из единого реестра
+import { R34_BASE } from '@/lib/sources'; // F-27: домены из единого реестра
+import { fetchSourcePage, isPostPageUsable } from '@/lib/r34-fetch';
 
 const CACHE_TTL = 30 * 60_000;
 
@@ -30,17 +33,6 @@ function checkRateLimit(ip: string, max = 30, windowMs = 60_000): boolean {
   return true;
 }
 
-function fetchViaJina(targetUrl: string): Promise<string> {
-  const encoded = JINA_READER + encodeURIComponent(targetUrl);
-  return fetch(encoded, {
-    headers: { 'Accept': 'text/html', 'X-Return-Format': 'html', 'X-No-Cache': 'true' },
-    signal: AbortSignal.timeout(30000),
-  }).then(r => {
-    if (!r.ok) throw new Error(`fetch failed`);
-    return r.text();
-  });
-}
-
 export async function GET(request: Request) {
   // F-15 fix + 18+ по подписке: серверный гейт — возраст И активная подписка
   const access = await checkAdultAccess(request, '/api/rule34-post');
@@ -61,13 +53,18 @@ export async function GET(request: Request) {
   }
 
   const cached = cache.get(postId);
-  if (cached && Date.now() - cached.ts < CACHE_TTL) {
+  if (cached) {
     return NextResponse.json(cached.data);
   }
 
   try {
     const targetUrl = `${R34_BASE}/index.php?page=post&s=view&id=${postId}`;
-    const html = await fetchViaJina(targetUrl);
+    const html = await fetchSourcePage(targetUrl, {
+      validate: isPostPageUsable,
+      jinaAttempts: 2,
+      tryDirect: true,
+      timeoutMs: 12_000,
+    });
 
     let imageUrl = '';
     const origLink = html.match(/href="([^"]+)"[^>]*>[^<]*Original image/);
@@ -112,7 +109,8 @@ export async function GET(request: Request) {
 
     cache.set(postId, { data, ts: Date.now() });
     return NextResponse.json(data);
-  } catch {
-    return NextResponse.json({ error: 'Failed to fetch post' });
+  } catch (e) {
+    logEvent('r34_post_fail', { id: postId, err: String(e).slice(0, 120) });
+    return NextResponse.json({ error: 'Source unavailable' }, { status: 502 });
   }
 }

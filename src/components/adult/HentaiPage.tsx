@@ -480,6 +480,14 @@ export function HentaiPage({ onOpen, favorites, onNavigate, toggleFav, hasSubscr
               <p>{artsError ? `Ошибка: ${artsError}` : 'Ничего не найдено'}</p>
               <p className="text-sm mt-1">Попробуйте другие теги на английском</p>
               {artsError && (
+                <button
+                  onClick={() => loadArts()}
+                  className="mt-3 px-4 py-2 rounded-lg bg-pink-500/20 text-pink-400 text-sm font-medium border border-pink-500/30 hover:bg-pink-500/30 transition-all"
+                >
+                  Повторить загрузку
+                </button>
+              )}
+              {artsError && (
                 <a
                   href={`https://rule34.xxx/index.php?page=post&s=list&tags=${encodeURIComponent(artsTags)}`}
                   target="_blank" rel="noopener noreferrer"
