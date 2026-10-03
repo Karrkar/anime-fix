@@ -9,6 +9,8 @@ import { logEvent } from '@/lib/logger';
 import { R34_BASE } from '@/lib/sources'; // F-27: домены из единого реестра
 import { fetchSourcePage, isPostPageUsable, R34_POST_SELECTOR } from '@/lib/r34-fetch';
 
+export const maxDuration = 60;
+
 const CACHE_TTL = 30 * 60_000;
 
 // F-20 fix: кэш ограничен (LRU + TTL)
@@ -63,9 +65,11 @@ export async function GET(request: Request) {
       validate: isPostPageUsable,
       jinaAttempts: 2,
       tryDirect: true,
-      timeoutMs: 12_000,
-      // 2026-10-03: X-Target-Selector — 50K токенов вместо 142K за пост
-      // (tag-sidebar + опции + image/video + og:image — всё внутри выборки)
+      // 2026-10-03: X-Target-Selector — 25-50K токенов вместо 142K за пост.
+      // НЮАНС: выборка требует полного рендера — пост-страница летит 18-20с
+      // (без селектора 9-10с, но 142K токенов). Таймаут 22с: попытка успевает,
+      // худший случай 2×22+1.5+9 ≈ 55с < maxDuration 60.
+      timeoutMs: 22_000,
       targetSelector: R34_POST_SELECTOR,
     });
 
