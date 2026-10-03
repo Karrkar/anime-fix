@@ -55,6 +55,8 @@ export function HentaiPage({ onOpen, favorites, onNavigate, toggleFav, hasSubscr
   artsPageRef.current = artsPage;
 
   const [artsError, setArtsError] = useState('');
+  // подсказка «переподключаемся…» во время авто-ретрая (визуальный фидбек)
+  const [artsRetryHint, setArtsRetryHint] = useState(false);
 
   // F-15 fix: самовосстановление — если localStorage-флаг ещё валиден,
   // а httpOnly-cookie age-гейта нет (например, cookies чистились),
@@ -65,7 +67,7 @@ export function HentaiPage({ onOpen, favorites, onNavigate, toggleFav, hasSubscr
     }
   }, []);
 
-  const loadArts = useCallback(async (tags?: string, page?: number) => {
+  const loadArts = useCallback(async (tags?: string, page?: number, _isRetry = false) => {
     const t = tags || artsTagsRef.current;
     const p = page || artsPageRef.current;
     const pid = (p - 1) * 42;
@@ -75,6 +77,13 @@ export function HentaiPage({ onOpen, favorites, onNavigate, toggleFav, hasSubscr
       const d = await apiFetch<{ posts: ParsedPost[]; total: number; page: number; totalPages: number; error?: string }>(
         `/api/rule34?tags=${encodeURIComponent(t)}&pid=${pid}`
       );
+      if ((d.error || d.posts.length === 0) && !_isRetry) {
+        // один авто-ретрай через 1.5с: запрос попадёт на другой инстанс Vercel —
+        // у него другой egress-IP, и блок Jina «bad IP reputation» часто обходит
+        setArtsRetryHint(true);
+        await new Promise(r => setTimeout(r, 1500));
+        return loadArts(t, p, true);
+      }
       if (d.error || d.posts.length === 0) {
         setArtsError('Не удалось загрузить арты');
         setArts([]);
@@ -90,7 +99,15 @@ export function HentaiPage({ onOpen, favorites, onNavigate, toggleFav, hasSubscr
         setArtsTotal(d.total);
         setArtsTotalPages(d.totalPages);
       }
-    } catch { setArtsError('Не удалось загрузить арты'); setArts([]); setArtsRaw([]); }
+    } catch {
+      if (!_isRetry) {
+        setArtsRetryHint(true);
+        await new Promise(r => setTimeout(r, 1500));
+        return loadArts(t, p, true);
+      }
+      setArtsError('Не удалось загрузить арты'); setArts([]); setArtsRaw([]);
+    }
+    setArtsRetryHint(false);
     setArtsLoading(false);
   }, []);
 
@@ -474,6 +491,9 @@ export function HentaiPage({ onOpen, favorites, onNavigate, toggleFav, hasSubscr
           </div>
 
           {/* Gallery grid */}
+          {artsRetryHint && (
+            <p className="text-center text-sm text-amber-400/90 mb-2">Источник капризничает — переподключаемся…</p>
+          )}
           {artsLoading ? <SkeletonGrid count={14} cols="grid-cols-3 sm:grid-cols-4 md:grid-cols-5 lg:grid-cols-7" aspect="aspect-square" gap="gap-2 sm:gap-3" /> : arts.length === 0 ? (
             <div className="text-center py-16 text-[var(--muted-foreground)]">
               <Search className="w-12 h-12 mx-auto mb-4 opacity-30" />

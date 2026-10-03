@@ -31,7 +31,9 @@ const PER_PAGE = 42;
 // 2026-10-01: +6 авторов (futarush, kiraamane, aliusnext, meitabuu, maldo, duxvector)
 const ARTIST_TAGS = ['arzagod', 'balecxi', 'kaistar', 'kinkimya', 'rognezart', 'hypet', 'backdoorsenpai', 'milfhunter228', 'futarush', 'kiraamane', 'aliusnext', 'meitabuu', 'maldo', 'duxvector'];
 
-const CACHE_TTL = 5 * 60_000;
+// 15 минут: контент rule34 меняется медленно, а каждый лишний запрос к Jina
+// (анонимный датацентровый IP) — риск 401-блока «bad IP reputation»
+const CACHE_TTL = 15 * 60_000;
 
 // F-20 fix: кэш ограничен (LRU + TTL) — раньше Map рос без границ в edge-инстансе
 const cache = new BoundedTTLCache<string, { posts: ParsedPost[]; totalPages: number; totalPosts: number }>(100, CACHE_TTL);

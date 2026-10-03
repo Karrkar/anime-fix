@@ -77,7 +77,9 @@ export async function fetchSourcePage(targetUrl: string, opts: FetchSourceOpts):
     } catch (e) {
       lastError = e instanceof Error ? e.message : String(e);
     }
-    if (i < jinaAttempts - 1) await sleep(600 + i * 500);
+    // 2026-10-03: блок Jina коррелирует во времени (окно по IP) — короткие
+    // паузы бесполезны; разводим попытки подальше друг от друга
+    if (i < jinaAttempts - 1) await sleep(1500 + i * 1000);
   }
 
   if (tryDirect) {
