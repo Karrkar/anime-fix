@@ -7,7 +7,7 @@ import { checkAdultAccess } from '@/lib/adult-access'; // 18+ = возраст +
 import { BoundedTTLCache } from '@/lib/cache';
 import { logEvent } from '@/lib/logger';
 import { R34_BASE } from '@/lib/sources'; // F-27: домены из единого реестра
-import { fetchSourcePage, isPostPageUsable } from '@/lib/r34-fetch';
+import { fetchSourcePage, isPostPageUsable, R34_POST_SELECTOR } from '@/lib/r34-fetch';
 
 const CACHE_TTL = 30 * 60_000;
 
@@ -64,6 +64,9 @@ export async function GET(request: Request) {
       jinaAttempts: 2,
       tryDirect: true,
       timeoutMs: 12_000,
+      // 2026-10-03: X-Target-Selector — 50K токенов вместо 142K за пост
+      // (tag-sidebar + опции + image/video + og:image — всё внутри выборки)
+      targetSelector: R34_POST_SELECTOR,
     });
 
     let imageUrl = '';

@@ -5,6 +5,7 @@ import { logEvent } from '@/lib/logger';
 import { notifyTelegram } from '@/lib/notify';
 import { recordSyncRun } from '@/lib/sync-status';
 import { FEELEX_BASE, XXX_IGRA_BASE, JINA_READER } from '@/lib/sources'; // F-27: домены из единого реестра
+import { jinaHeaders } from '@/lib/jina'; // 2026-10-03: ключ JINA_API_KEY снимает блок датацентровых IP
 
 export const maxDuration = 60;
 
@@ -22,7 +23,7 @@ async function fetchPage(url: string, retries = 1): Promise<string> {
   for (let i = 0; i <= retries; i++) {
     try {
       const r = await fetch(JINA_READER + encodeURIComponent(url), {
-        headers: { Accept: 'text/html', 'X-Return-Format': 'html', 'X-No-Cache': 'true' },
+        headers: jinaHeaders(),
         signal: AbortSignal.timeout(12000),
       });
       if (r.ok) return await r.text();

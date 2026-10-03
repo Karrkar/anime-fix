@@ -5,6 +5,7 @@ import { logEvent } from '@/lib/logger';
 import { notifyTelegram } from '@/lib/notify';
 import { recordSyncRun } from '@/lib/sync-status';
 import { VOST_BASE, JINA_READER } from '@/lib/sources'; // F-27: домены из единого реестра
+import { jinaHeaders } from '@/lib/jina'; // 2026-10-03: ключ JINA_API_KEY снимает блок датацентровых IP
 
 // Лимит времени функции: крон парсит страницы + refresh новых серий.
 // 60с — максимум для Hobby-плана Vercel.
@@ -42,7 +43,7 @@ async function fetchPage(url: string, retries = 2, timeoutMs = 30000): Promise<s
   for (let i = 0; i <= retries; i++) {
     try {
       const r = await fetch(JINA_READER + encodeURIComponent(url), {
-        headers: { Accept: 'text/html', 'X-Return-Format': 'html', 'X-No-Cache': 'true' },
+        headers: jinaHeaders(),
         signal: AbortSignal.timeout(timeoutMs),
       });
       if (r.ok) return await r.text();

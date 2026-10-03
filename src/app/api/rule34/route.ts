@@ -10,7 +10,7 @@ import { checkAdultAccess } from '@/lib/adult-access'; // 18+ = возраст +
 import { BoundedTTLCache } from '@/lib/cache';
 import { logEvent } from '@/lib/logger';
 import { R34_BASE } from '@/lib/sources'; // F-27: домены из единого реестра
-import { fetchSourcePage, isListPageUsable, sleep } from '@/lib/r34-fetch';
+import { fetchSourcePage, isListPageUsable, R34_LIST_SELECTOR, sleep } from '@/lib/r34-fetch';
 
 export const maxDuration = 60;
 
@@ -120,6 +120,10 @@ async function fetchListPage(targetUrl: string, mode: 'full' | 'fast'): Promise<
     jinaAttempts: mode === 'full' ? 3 : 1,
     tryDirect: mode === 'full',
     timeoutMs: 12_000,
+    // 2026-10-03: X-Target-Selector '.content' — 25K токенов вместо 171K
+    // за страницу (х7 к бюджету ключа Jina). Прямой фолбэк идёт БЕЗ селектора
+    // — он берёт страницу целиком напрямую с источника.
+    targetSelector: R34_LIST_SELECTOR,
   });
   // страница валидна: есть thumb-ы → контент; есть только «chickens» → тег честно пуст
   return { html, empty: !html.includes('class="thumb"') };

@@ -12,19 +12,22 @@
  * Опционально: env JINA_API_KEY — бесплатный ключ с jina.ai снимает
  * рейт-лимит/блок целиком (ставится в Vercel → Settings → Environment
  * Variables). Без ключа цепочка тоже работает, просто с ретраями.
+ *
+ * 2026-10-03 (ключ получен): + X-Target-Selector — выборка только нужных
+ * элементов вместо всей страницы. Полный HTML списка ~412KB = 171K токенов
+ * за запрос; с селектором «.content» — 98KB = 25K токенов (экономия 6.9x,
+ * бюджет 10M бесплатных токенов растёт с ~58 до ~400 страниц). На пустых
+ * тегах «chickens» остаётся внутри .content и честно детектится валидатором.
  */
 import { JINA_READER } from '@/lib/sources';
+import { jinaHeaders } from '@/lib/jina';
 
 export const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
 
-async function jinaFetch(targetUrl: string, timeoutMs: number): Promise<string> {
-  const headers: Record<string, string> = {
-    Accept: 'text/html',
-    'X-Return-Format': 'html',
-    'X-No-Cache': 'true',
-  };
-  const key = process.env.JINA_API_KEY?.trim();
-  if (key) headers.Authorization = `Bearer ${key}`;
+async function jinaFetch(targetUrl: string, timeoutMs: number, targetSelector?: string): Promise<string> {
+  const headers = jinaHeaders(
+    targetSelector ? { 'X-Target-Selector': targetSelector } : undefined,
+  );
   const r = await fetch(JINA_READER + encodeURIComponent(targetUrl), {
     headers,
     signal: AbortSignal.timeout(timeoutMs),
@@ -56,6 +59,10 @@ export interface FetchSourceOpts {
   tryDirect?: boolean;
   /** Таймаут одного запроса, мс (по умолчанию 12000). */
   timeoutMs?: number;
+  /** CSS-селектор(ы) X-Target-Selector — выборка нужных элементов вместо
+   * всей страницы (экономия токенов Jina до 7x). Селектор обязан покрывать
+   * всё, что проверяет validate и что парсит вызывающий код. */
+  targetSelector?: string;
 }
 
 /**
@@ -71,7 +78,7 @@ export async function fetchSourcePage(targetUrl: string, opts: FetchSourceOpts):
 
   for (let i = 0; i < jinaAttempts; i++) {
     try {
-      const html = await jinaFetch(targetUrl, timeoutMs);
+      const html = await jinaFetch(targetUrl, timeoutMs, opts.targetSelector);
       if (opts.validate(html)) return html;
       lastError = 'unparseable jina response';
     } catch (e) {
@@ -103,6 +110,15 @@ export async function fetchSourcePage(targetUrl: string, opts: FetchSourceOpts):
 export function isListPageUsable(html: string): boolean {
   return html.includes('class="thumb"') || html.includes('chickens');
 }
+
+/** Селектор страниц-списков: .content содержит .image-list (thumbs),
+ * #paginator (total) и «chickens» на пустых тегах — всё, что нужно
+ * валидатору и парсеру. 25K токенов вместо 171K за запрос. */
+export const R34_LIST_SELECTOR = '.content';
+
+/** Селектор страниц постов: #post-view (tag-sidebar + опции + image/video),
+ * og:image из head, video/source для видео-постов. 50K токенов вместо 142K. */
+export const R34_POST_SELECTOR = "#post-view, meta[property='og:image'], video, source";
 
 /** Валидатор страниц постов: характерные блоки карточки поста. */
 export function isPostPageUsable(html: string): boolean {
