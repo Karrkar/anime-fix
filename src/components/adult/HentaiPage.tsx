@@ -254,12 +254,13 @@ export function HentaiPage({ onOpen, favorites, onNavigate, toggleFav, hasSubscr
         </div>
       </div>
 
-      {/* Tabs */}
-      <div className="flex gap-2 mb-6">
+      {/* Tabs — mobile: горизонтальный свайп (5 вкладок не влезают в 360px),
+          десктоп: как раньше (скроллбар скрыт глобально в globals.css) */}
+      <div className="flex gap-2 mb-6 overflow-x-auto pb-1 -mx-4 px-4 sm:mx-0 sm:px-0">
         {([['catalog', 'Каталог', List], ['creative', 'Креатив', Sparkles], ['games', 'Игры', Gamepad2], ['arts', 'Арты', ImageIcon], ['lilith', 'Лилит', MessageCircle]] as const).map(([t, label, Icon]) => (
           <button
             key={t} onClick={() => { setTab(t as 'catalog' | 'creative' | 'arts' | 'games' | 'lilith'); setCurrentPage(1); }}
-            className={`flex items-center gap-2 px-4 py-2.5 rounded-xl text-sm font-medium transition-all ${tab === t
+            className={`flex items-center gap-2 px-3.5 sm:px-4 py-2.5 rounded-xl text-sm font-medium transition-all shrink-0 whitespace-nowrap ${tab === t
               ? 'bg-gradient-to-r from-red-600 to-pink-600 text-white shadow-lg shadow-red-500/20'
               : 'bg-[var(--card)] border border-[var(--border)] text-[var(--muted-foreground)] hover:text-[var(--foreground)] hover:bg-[var(--muted)]'}`}
           >
