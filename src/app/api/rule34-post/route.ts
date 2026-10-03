@@ -90,11 +90,25 @@ export async function GET(request: Request) {
     }
     imageUrl = imageUrl.replace(/(https?:\/\/[^\/]+)\/\//, '$1/');
 
-    // Detect video
+    // Detect video. 2026-10-03 fix: на страницах постов rule34 крутит рекламу
+    // с собственными <video src="…bkcdn.net/….mp4"> — старый код считал их
+    // видео поста и ЗАТИРАЛ правильный imageUrl рекламным URL. Теперь видео
+    // поста = mp4/webm с домена rule34.xxx (ahrimp4/wimg) ИЛИ mp4/webm в
+    // ссылке «Original image» (у видео-постов она указывает на сам файл).
+    const isRule34Media = (u: string): boolean => {
+      try {
+        return new URL(u).hostname.endsWith('rule34.xxx');
+      } catch {
+        return false;
+      }
+    };
     const videoMatch = html.match(/src="([^"]+\.(?:mp4|webm))"[^>]*type="video/) ||
                         html.match(/(?:source|video)[^>]*src="([^"]+\.(?:mp4|webm))/);
-    const isVideo = !!videoMatch;
-    if (isVideo && videoMatch) imageUrl = videoMatch[1].replace(/&amp;/g, '&');
+    const realVideoUrl =
+      videoMatch && isRule34Media(videoMatch[1]) ? videoMatch[1].replace(/&amp;/g, '&') : '';
+    const isVideo =
+      !!realVideoUrl || (imageUrl !== '' && /\.(?:mp4|webm)(?:\?|$)/i.test(imageUrl));
+    if (realVideoUrl) imageUrl = realVideoUrl;
 
     // Extract tags
     const tags: string[] = [];
