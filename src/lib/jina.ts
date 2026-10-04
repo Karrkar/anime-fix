@@ -27,7 +27,10 @@ export function jinaHeaders(extra?: Record<string, string>): Record<string, stri
   const headers: Record<string, string> = {
     Accept: 'text/html',
     'X-Return-Format': 'html',
-    'X-No-Cache': 'true',
+    // 2026-10-04: X-No-Cache убран — edge-кэш Jina (~10 мин) гасит повторы
+    // одинаковых страниц и резко снижает давление на рейт-лимит (анонимно
+    // всего 20 RPM). Свежесть поверх этого держит 15-мин кэш приложения —
+    // для rule34 этого достаточно, контент там меняется медленно.
   };
   const key = process.env.JINA_API_KEY?.trim();
   if (key && Date.now() >= keyDeadUntil) headers.Authorization = `Bearer ${key}`;

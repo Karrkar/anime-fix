@@ -91,15 +91,18 @@ export async function fetchSourcePage(targetUrl: string, opts: FetchSourceOpts):
   const timeoutMs = opts.timeoutMs ?? 12_000;
   const jinaAttempts = Math.max(1, Math.min(opts.jinaAttempts ?? 2, 3));
   const tryDirect = opts.tryDirect ?? true;
-  let lastError = 'no attempt';
+  // 2026-10-04: собираем ВСЕ ошибки попыток — в 502-detail видна вся цепочка
+  // (какой статус давала Jina и прямой запрос) — диагностика без доступа
+  // к Runtime Logs Vercel
+  const errors: string[] = [];
 
   for (let i = 0; i < jinaAttempts; i++) {
     try {
       const html = await jinaFetch(targetUrl, timeoutMs, opts.targetSelector);
       if (opts.validate(html)) return html;
-      lastError = 'unparseable jina response';
+      errors.push(`jina#${i + 1}: unparseable`);
     } catch (e) {
-      lastError = e instanceof Error ? e.message : String(e);
+      errors.push(`jina#${i + 1}: ${e instanceof Error ? e.message : String(e)}`);
     }
     // 2026-10-03: блок Jina коррелирует во времени (окно по IP) — короткие
     // паузы бесполезны; разводим попытки подальше друг от друга
@@ -110,13 +113,13 @@ export async function fetchSourcePage(targetUrl: string, opts: FetchSourceOpts):
     try {
       const html = await directFetch(targetUrl, 9000);
       if (opts.validate(html)) return html;
-      lastError = 'unparseable direct response';
+      errors.push('direct: unparseable');
     } catch (e) {
-      lastError = e instanceof Error ? e.message : String(e);
+      errors.push(`direct: ${e instanceof Error ? e.message : String(e)}`);
     }
   }
 
-  throw new Error(`source unavailable: ${lastError}`);
+  throw new Error(`source unavailable [${errors.join('; ').slice(0, 200)}]`);
 }
 
 /**
