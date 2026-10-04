@@ -38,6 +38,25 @@ function isVideoUrl(url: string): boolean {
   return /\.(mp4|webm|mov|avi)(\?|$)/i.test(url) || url.includes('/videos/');
 }
 
+/** 2026-10-04: нормализация URL картинок — сброс кэш-бастера (?<postId>).
+ * Миниатюры приходят как …/thumbnail_<hash>.jpg?18443016 — query уникален
+ * для каждого поста, хотя файл один и тот же. Без нормализации кэш (сервер
+ * + CDN edge + браузер) не сводит повторные запросы, и активное листание
+ * грида генерирует десятки уникальных upstream-запросов — Cloudflare
+ * банил за это egress-IP инстансов (наблюдались 502 сериями). Видео-URL
+ * НЕ трогаем — там стриминг с Range, параметры могут значить больше. */
+function normalizeImageUrl(url: string): string {
+  if (isVideoUrl(url)) return url;
+  try {
+    const u = new URL(url);
+    if (u.search && /\.(jpe?g|png|gif|webp)$/i.test(u.pathname)) {
+      u.search = '';
+      return u.toString();
+    }
+  } catch { /* битый URL — отдаём как есть, upstream честно откажет */ }
+  return url;
+}
+
 /**
  * ВИДЕО — СТРИМИНГ С ПРОБРОСОМ RANGE (фикс «плеер хентая не работает»):
  *
@@ -126,16 +145,20 @@ export async function GET(request: Request) {
   if (!access.ok) return access.response;
 
   const { searchParams } = new URL(request.url);
-  const url = searchParams.get('url');
-  if (!url) return NextResponse.json({ error: 'Missing url' }, { status: 400 });
+  const rawUrl = searchParams.get('url');
+  if (!rawUrl) return NextResponse.json({ error: 'Missing url' }, { status: 400 });
 
   let parsed: URL;
-  try { parsed = new URL(url); } catch { return NextResponse.json({ error: 'Invalid url' }, { status: 400 }); }
+  try { parsed = new URL(rawUrl); } catch { return NextResponse.json({ error: 'Invalid url' }, { status: 400 }); }
 
   // ФИКС: wildcard-проверка — video-CDN rule34 мигрирует между поддоменами
   if (!isAllowedR34Host(parsed.hostname)) {
     return NextResponse.json({ error: 'Host not allowed' }, { status: 403 });
   }
+
+  // 2026-10-04: единый канонический URL (без кэш-бастера для картинок) —
+  // ключ кэша и upstream-запрос
+  const url = normalizeImageUrl(rawUrl);
 
   // ── Картинки из кэша: отдаём ДО rate limit ───────────────────────
   // Кэш-попадание не ходит в upstream и ничего не стоит — несправедливо
@@ -173,17 +196,28 @@ export async function GET(request: Request) {
   }
 
   // ── Картинки: upstream fetch + буфер + кэш ────────────────────────
+  // 2026-10-04: до 3 попыток с паузами — Cloudflare CDN выдаёт transient
+  // 403/429 egress-IP инстансов (наблюдалось сериями после залпов
+  // запросов); ретрай с выдержкой часто проходит, а браузер <img> своим
+  // onError уже не поможет — он уходит на прямой URL, в РФ заблокированный
   try {
-    const res = await fetch(url, {
-      headers: {
-        'User-Agent': UA,
-        'Accept': 'image/*,*/*;q=0.8',
-        'Referer': `${R34_BASE}/`,
-      },
-      signal: AbortSignal.timeout(12_000),
-    });
-
-    if (!res.ok) return NextResponse.json({ error: 'Upstream error' }, { status: 502 });
+    let res: Response | null = null;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      if (attempt > 0) await new Promise(r => setTimeout(r, 700 * attempt));
+      try {
+        res = await fetch(url, {
+          headers: {
+            'User-Agent': UA,
+            'Accept': 'image/*,*/*;q=0.8',
+            'Referer': `${R34_BASE}/`,
+          },
+          signal: AbortSignal.timeout(12_000),
+        });
+        if (res.ok) break;
+        res = null; // не-200 — ещё попытка
+      } catch { res = null; }
+    }
+    if (!res) return NextResponse.json({ error: 'Upstream error' }, { status: 502 });
 
     const contentType = res.headers.get('content-type') || '';
     const buffer = await res.arrayBuffer();

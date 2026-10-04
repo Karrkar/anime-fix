@@ -33,7 +33,7 @@ async function jinaFetch(targetUrl: string, timeoutMs: number, targetSelector?: 
     signal: AbortSignal.timeout(timeoutMs),
   });
   if (!r.ok) {
-    // 2026-10-04 fix «арты вообще не грузятся»: ключ с нулевым балансом
+    // 2026-10-04 fix «чёрный экран на телефоне»: ключ с нулевым балансом
     // (402) или убитой аутентификацией (401) рвал ВСЮ цепочку. Отмечаем
     // ключ мёртвым и немедленно ретраим ту же попытку анонимно — частичный
     // доступ лучше полного нуля. Дальнейшие вызовы jinaHeaders() уже
@@ -47,6 +47,19 @@ async function jinaFetch(targetUrl: string, timeoutMs: number, targetSelector?: 
       });
       if (r2.ok) return r2.text();
       throw new Error(`jina http ${r2.status} (anon fallback)`);
+    }
+    // 2026-10-04: 422 = X-Target-Selector не нашёл совпадений на странице
+    // (вид Structure отличается у некоторых постов) — ретраим ту же попытку
+    // БЕЗ селектора: полная страница дороже по токенам, но приходит даже
+    // быстрее (рендер выборки — самая медленная часть)
+    if (r.status === 422 && targetSelector) {
+      const fullHeaders = jinaHeaders();
+      const r3 = await fetch(JINA_READER + encodeURIComponent(targetUrl), {
+        headers: fullHeaders,
+        signal: AbortSignal.timeout(timeoutMs),
+      });
+      if (r3.ok) return r3.text();
+      throw new Error(`jina http ${r3.status} (no-selector fallback)`);
     }
     throw new Error(`jina http ${r.status}`);
   }
