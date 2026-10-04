@@ -24,7 +24,9 @@ import { jinaHeaders, markJinaKeyRejected } from '@/lib/jina';
 
 export const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
 
-async function jinaFetch(targetUrl: string, timeoutMs: number, targetSelector?: string): Promise<string> {
+/** Результат jinaFetch: html — ответ; null — 422 (селектор не нашёл
+ * совпадений на странице); Error — прочие отказы. */
+async function jinaFetch(targetUrl: string, timeoutMs: number, targetSelector?: string): Promise<string | null> {
   const extra = targetSelector ? { 'X-Target-Selector': targetSelector } : undefined;
   const headers = jinaHeaders(extra);
   const withKey = 'Authorization' in headers;
@@ -33,7 +35,7 @@ async function jinaFetch(targetUrl: string, timeoutMs: number, targetSelector?: 
     signal: AbortSignal.timeout(timeoutMs),
   });
   if (!r.ok) {
-    // 2026-10-04 fix «чёрный экран на телефоне»: ключ с нулевым балансом
+    // 2026-10-04 fix «арты вообще не грузятся»: ключ с нулевым балансом
     // (402) или убитой аутентификацией (401) рвал ВСЮ цепочку. Отмечаем
     // ключ мёртвым и немедленно ретраим ту же попытку анонимно — частичный
     // доступ лучше полного нуля. Дальнейшие вызовы jinaHeaders() уже
@@ -46,21 +48,13 @@ async function jinaFetch(targetUrl: string, timeoutMs: number, targetSelector?: 
         signal: AbortSignal.timeout(timeoutMs),
       });
       if (r2.ok) return r2.text();
+      // 422 и здесь — селектор не совпал (сигнал вызывающему коду)
+      if (r2.status === 422) return null;
       throw new Error(`jina http ${r2.status} (anon fallback)`);
     }
-    // 2026-10-04: 422 = X-Target-Selector не нашёл совпадений на странице
-    // (вид Structure отличается у некоторых постов) — ретраим ту же попытку
-    // БЕЗ селектора: полная страница дороже по токенам, но приходит даже
-    // быстрее (рендер выборки — самая медленная часть)
-    if (r.status === 422 && targetSelector) {
-      const fullHeaders = jinaHeaders();
-      const r3 = await fetch(JINA_READER + encodeURIComponent(targetUrl), {
-        headers: fullHeaders,
-        signal: AbortSignal.timeout(timeoutMs),
-      });
-      if (r3.ok) return r3.text();
-      throw new Error(`jina http ${r3.status} (no-selector fallback)`);
-    }
+    // 422 = X-Target-Selector не нашёл совпадений на странице — вызывающий
+    // код решит, попробовать ли полную страницу
+    if (r.status === 422) return null;
     throw new Error(`jina http ${r.status}`);
   }
   return r.text();
@@ -110,9 +104,26 @@ export async function fetchSourcePage(targetUrl: string, opts: FetchSourceOpts):
   const errors: string[] = [];
 
   for (let i = 0; i < jinaAttempts; i++) {
+    let selectorUsed = false; // полный дубли полной страницы в этой попытке
     try {
-      const html = await jinaFetch(targetUrl, timeoutMs, opts.targetSelector);
+      let html = await jinaFetch(targetUrl, timeoutMs, opts.targetSelector);
+      if (html === null) {
+        // 422: X-Target-Selector не нашёл совпадений — полная страница
+        selectorUsed = true;
+        html = await jinaFetch(targetUrl, timeoutMs, undefined);
+        if (html === null) {
+          errors.push(`jina#${i + 1}: 422 даже без селектора`);
+          if (i < jinaAttempts - 1) await sleep(1500 + i * 1000);
+          continue;
+        }
+      }
       if (opts.validate(html)) return html;
+      // Контент пришёл, но непригоден (сегмент селектора без нужных маркеров
+      // / страница-заглушка) — если это была выборка, пробуем полную страницу
+      if (!selectorUsed && opts.targetSelector) {
+        const full = await jinaFetch(targetUrl, timeoutMs, undefined);
+        if (full !== null && opts.validate(full)) return full;
+      }
       errors.push(`jina#${i + 1}: unparseable`);
     } catch (e) {
       errors.push(`jina#${i + 1}: ${e instanceof Error ? e.message : String(e)}`);
