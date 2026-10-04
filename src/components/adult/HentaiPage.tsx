@@ -126,7 +126,7 @@ export function HentaiPage({ onOpen, favorites, onNavigate, toggleFav, hasSubscr
   }, [artsRaw]);
 
   // Open art viewer
-  const openArtViewer = useCallback(async (post: ParsedPost) => {
+  const openArtViewer = useCallback(async (post: ParsedPost, _isRetry = false) => {
     setViewerArt(post);
     setViewerFullImg('');
     setViewerFullTags(post.tags);
@@ -147,6 +147,13 @@ export function HentaiPage({ onOpen, favorites, onNavigate, toggleFav, hasSubscr
       }
       if (d.tags && d.tags.length > 0) setViewerFullTags(d.tags);
     } catch {
+      // 2026-10-04: один авто-ретрай через 1.5с — запрос попадёт на другой
+      // инстанс Vercel с другим egress-IP: блок Jina «bad IP reputation»
+      // индивидуален для IP, второй инстанс часто проходит
+      if (!_isRetry) {
+        await new Promise(r => setTimeout(r, 1500));
+        return openArtViewer(post, true);
+      }
       setViewerError('Полноразмерный арт не загрузился');
     }
     setViewerLoading(false);

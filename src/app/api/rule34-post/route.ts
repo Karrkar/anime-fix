@@ -146,6 +146,6 @@ export async function GET(request: Request) {
     if (st) {
       return NextResponse.json(st, { headers: { 'X-Data-Stale': '1' } });
     }
-    return NextResponse.json({ error: 'Source unavailable' }, { status: 502 });
+    return NextResponse.json({ error: 'Source unavailable', detail: String(e).slice(0, 200) }, { status: 502 });
   }
 }
