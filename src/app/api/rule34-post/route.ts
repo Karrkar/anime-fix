@@ -16,6 +16,13 @@ const CACHE_TTL = 30 * 60_000;
 // F-20 fix: кэш ограничен (LRU + TTL)
 const cache = new BoundedTTLCache<string, { data: Record<string, unknown>; ts: number }>(200, CACHE_TTL);
 
+// 2026-10-04 fix «чёрный экран на телефоне»: stale-кэш последнего успешного
+// ответа (24ч). Деталка через Jina занимает 18-22с и может вообще не прийти
+// (лимит/блок) — повторное открытие того же арта не должно снова ждать и
+// падать в пустоту: отдаём последнюю успешную версию (пусть и старую).
+// Клиент при полном провале показывает миниатюру через прокси + «Повторить».
+const stale = new BoundedTTLCache<string, Record<string, unknown>>(600, 24 * 60 * 60_000);
+
 // In-memory rate limit (per-IP, 30 req/min)
 const rlBuckets = new Map<string, number[]>();
 function checkRateLimit(ip: string, max = 30, windowMs = 60_000): boolean {
@@ -129,9 +136,16 @@ export async function GET(request: Request) {
     };
 
     cache.set(postId, { data, ts: Date.now() });
+    stale.set(postId, data);
     return NextResponse.json(data);
   } catch (e) {
     logEvent('r34_post_fail', { id: postId, err: String(e).slice(0, 120) });
+    // источник отказал — последнее живое (до 24ч), иначе честный 502;
+    // клиент покажет миниатюру через прокси и кнопку «Повторить»
+    const st = stale.get(postId);
+    if (st) {
+      return NextResponse.json(st, { headers: { 'X-Data-Stale': '1' } });
+    }
     return NextResponse.json({ error: 'Source unavailable' }, { status: 502 });
   }
 }

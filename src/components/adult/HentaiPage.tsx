@@ -3,7 +3,7 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import Image from 'next/image';
-import { Search, Star, ChevronLeft, ChevronRight, X, ImageIcon, List, Filter, SortAsc, Flame, Tag, ExternalLink, Gamepad2, MessageCircle, Sparkles } from 'lucide-react';
+import { Search, Star, ChevronLeft, ChevronRight, X, ImageIcon, List, Filter, SortAsc, Flame, Tag, ExternalLink, Gamepad2, MessageCircle, Sparkles, RotateCcw } from 'lucide-react';
 import { LilithChat } from '@/app/chat-widget';
 import { ArtViewerImage, HentaiCard } from '@/components/adult/AdultCards';
 import { AgeGate } from '@/components/adult/AgeGate';
@@ -33,6 +33,11 @@ export function HentaiPage({ onOpen, favorites, onNavigate, toggleFav, hasSubscr
   const [viewerFullTags, setViewerFullTags] = useState<string[]>([]);
   const [viewerLoading, setViewerLoading] = useState(false);
   const [viewerIsVideo, setViewerIsVideo] = useState(false);
+  // 2026-10-04 fix «чёрный экран на телефоне»: деталка может не прийти (Jina
+  // недоступен/медленный рендер 18-22с) — раньше лайтбокс оставался пустым
+  // (прямой CDN в РФ мёртв, грузить было нечего). Теперь: превью-миниатюра
+  // через прокси сразу + честная плашка «Повторить» при неудаче.
+  const [viewerError, setViewerError] = useState('');
 
   // Search & filter state (catalog)
   const [searchQuery, setSearchQuery] = useState('');
@@ -127,16 +132,23 @@ export function HentaiPage({ onOpen, favorites, onNavigate, toggleFav, hasSubscr
     setViewerFullTags(post.tags);
     setViewerLoading(true);
     setViewerIsVideo(false);
+    setViewerError('');
     try {
-      const d = await apiFetch<{ imageUrl?: string; isVideo?: boolean; tags?: string[]; error?: string }>(
+      const d = await apiFetch<{ imageUrl?: string; isVideo?: boolean; tags?: string[]; error?: string; stale?: boolean }>(
         `/api/rule34-post?id=${post.id}`
       );
       if (d.imageUrl) {
         setViewerFullImg(d.imageUrl);
         if (d.isVideo) setViewerIsVideo(true);
+      } else {
+        // полноразмерный арт не получен — ArtViewerImage покажет миниатюру
+        // через прокси, а плашка предложит повторить
+        setViewerError('Полноразмерный арт не загрузился');
       }
       if (d.tags && d.tags.length > 0) setViewerFullTags(d.tags);
-    } catch {}
+    } catch {
+      setViewerError('Полноразмерный арт не загрузился');
+    }
     setViewerLoading(false);
   }, []);
 
@@ -145,6 +157,7 @@ export function HentaiPage({ onOpen, favorites, onNavigate, toggleFav, hasSubscr
     setViewerFullImg('');
     setViewerFullTags([]);
     setViewerIsVideo(false);
+    setViewerError('');
   }, []);
 
   const viewerIndex = viewerArt ? artsRaw.findIndex(a => a.id === viewerArt.id) : -1;
@@ -628,9 +641,22 @@ export function HentaiPage({ onOpen, favorites, onNavigate, toggleFav, hasSubscr
                 </button>
               )}
               {viewerLoading ? (
-                <div className="flex flex-col items-center gap-3">
+                /* 2026-10-04: вместо одинокого спиннера на чёрном фоне —
+                   размытая миниатюра через прокси (она уже в серверном кэше
+                   от грида — появляется мгновенно) + спиннер поверх.
+                   Деталка через Jina рендерится до ~20с; раньше всё это
+                   время (и при отказе — навсегда) экран был пустым */
+                <div className="relative flex flex-col items-center justify-center gap-3">
+                  {viewerArt.thumbnailUrl && (
+                    <img
+                      src={`/api/r34img?url=${encodeURIComponent(viewerArt.thumbnailUrl)}`}
+                      alt={viewerArt.title}
+                      referrerPolicy="no-referrer"
+                      className="max-w-[min(70vw,420px)] max-h-[50vh] object-contain rounded-lg opacity-40 blur-[2px]"
+                    />
+                  )}
                   <div className="w-8 h-8 border-3 border-pink-500/30 border-t-pink-500 rounded-full animate-spin" />
-                  <span className="text-xs text-white/50">\u0417\u0430\u0433\u0440\u0443\u0437\u043a\u0430...</span>
+                  <span className="text-xs text-white/50">Загрузка...</span>
                 </div>
               ) : viewerIsVideo && viewerFullImg ? (
                 <video
@@ -645,11 +671,24 @@ export function HentaiPage({ onOpen, favorites, onNavigate, toggleFav, hasSubscr
                   Ваш браузер не поддерживает видео.
                 </video>
               ) : (
-                <ArtViewerImage
-                  fullImgUrl={viewerFullImg}
-                  thumbnailUrl={viewerArt.thumbnailUrl}
-                  title={viewerArt.title}
-                />
+                <div className="relative flex flex-col items-center justify-center">
+                  <ArtViewerImage
+                    fullImgUrl={viewerFullImg}
+                    thumbnailUrl={viewerArt.thumbnailUrl}
+                    title={viewerArt.title}
+                  />
+                  {/* Деталка не далась (Jina лимит/блок) — миниатюра уже
+                      показана ArtViewerImage; предлагаем повторить полноразмер */}
+                  {viewerError && viewerArt && (
+                    <button
+                      onClick={(e) => { e.stopPropagation(); openArtViewer(viewerArt); }}
+                      className="mt-4 px-4 py-2 rounded-lg bg-pink-500/20 hover:bg-pink-500/40 border border-pink-500/40 text-pink-100 text-xs sm:text-sm transition-colors flex items-center gap-2 z-[2]"
+                    >
+                      <RotateCcw className="w-3.5 h-3.5" />
+                      Повторить загрузку
+                    </button>
+                  )}
+                </div>
               )}
             </div>
 

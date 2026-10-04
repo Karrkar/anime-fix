@@ -3,7 +3,7 @@
 import { useState } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import Image from 'next/image';
-import { Heart, Play, Film, Clock4 } from 'lucide-react';
+import { Heart, Play, Film, Clock4, ImageIcon } from 'lucide-react';
 import { Anime } from '@/lib/client-types';
 import { BLUR_DATA_URL, parseGenres } from '@/lib/client-utils';
 
@@ -77,46 +77,74 @@ export function HentaiCard({ anime, onOpen, onFav, isFav }: {
 
 /* ──────────────────── Art Viewer Image ──────────────────── */
 export function ArtViewerImage({ fullImgUrl, thumbnailUrl, title }: { fullImgUrl: string; thumbnailUrl: string; title: string }) {
+  // 2026-10-04 fix «чёрный экран на телефоне»: ВСЯ графика — через прокси.
+  // Раньше превью-миниатюра и фолбэк при пустой деталке шли ПРЯМЫМ URL на CDN
+  // rule34 (wimg.* и т.п.), который у мобильных провайдеров РФ заблокирован —
+  // лайтбокс открывался в пустоту: чёрный фон без единого пикселя. Сетка
+  // при этом работала (Rule34ArtCard уже ходит через /api/r34img) —
+  // несоответствие «сетка есть, просмотр пустой» и был симптомом.
   const [imgError, setImgError] = useState(false);
-  // PROXY-FIRST: rule34.xxx заблокирован провайдерами РФ — прямой запрос к CDN
-  // у таких пользователей висит до таймаута, прежде чем сработал бы фолбэк.
-  // Сразу идём через кэширующий прокси; прямой URL — запасной путь.
   const [useDirect, setUseDirect] = useState(false);
+  const [thumbDirect, setThumbDirect] = useState(false);
   const [showThumb, setShowThumb] = useState(true);
+
+  const proxied = (u: string) => `/api/r34img?url=${encodeURIComponent(u)}`;
 
   let src = '';
   if (fullImgUrl && !imgError) {
-    src = useDirect
-      ? fullImgUrl
-      : `/api/r34img?url=${encodeURIComponent(fullImgUrl)}`;
-  } else {
-    src = thumbnailUrl;
+    src = useDirect ? fullImgUrl : proxied(fullImgUrl);
+  } else if (thumbnailUrl) {
+    // фолбэк: хотя бы миниатюра, тоже через прокси (прямой CDN в РФ мёртв)
+    src = thumbDirect ? thumbnailUrl : proxied(thumbnailUrl);
   }
+
+  const previewSrc = thumbnailUrl
+    ? (thumbDirect ? thumbnailUrl : proxied(thumbnailUrl))
+    : '';
 
   return (
     <>
-      {/* Show thumbnail immediately while full image loads */}
-      {showThumb && fullImgUrl && (
+      {/* Размытая миниатюра сразу — пока полноразмерный арт грузится/рендерится
+          (деталка через Jina занимает до ~20с, миниатюра уже в кэше прокси
+          от грида — она появляется мгновенно вместо чёрного экрана) */}
+      {showThumb && previewSrc && (
         <img
-          src={thumbnailUrl}
+          src={previewSrc}
           alt={title}
           referrerPolicy="no-referrer"
           className="absolute max-w-[200px] max-h-[200px] object-contain rounded-lg opacity-40 blur-sm"
+          onError={() => {
+            if (!thumbDirect) setThumbDirect(true);
+          }}
         />
       )}
-      <img
-        key={src}
-        src={src}
-        alt={title}
-        referrerPolicy={useDirect ? 'no-referrer' : undefined}
-        className="max-w-full max-h-full object-contain select-none relative z-[1]"
-        onLoad={() => setShowThumb(false)}
-        onError={() => {
-          if (fullImgUrl && !useDirect) { setUseDirect(true); }
-          else if (fullImgUrl && useDirect) { setImgError(true); }
-          setShowThumb(false);
-        }}
-      />
+      {src && (
+        <img
+          key={src}
+          src={src}
+          alt={title}
+          referrerPolicy={(useDirect && fullImgUrl && !imgError) ? 'no-referrer' : undefined}
+          className="max-w-full max-h-full object-contain select-none relative z-[1]"
+          onLoad={() => setShowThumb(false)}
+          onError={() => {
+            if (fullImgUrl && !imgError) {
+              if (!useDirect) { setUseDirect(true); }
+              else { setImgError(true); }
+            } else if (!thumbDirect) {
+              // миниатюра через прокси не прошла — пробуем прямой CDN
+              setThumbDirect(true);
+            }
+            setShowThumb(false);
+          }}
+        />
+      )}
+      {/* Ничего не загрузилось совсем — честная заглушка вместо пустоты */}
+      {!src && !previewSrc && (
+        <div className="flex flex-col items-center gap-2 text-white/40">
+          <ImageIcon className="w-10 h-10" />
+          <span className="text-xs">Не удалось загрузить изображение</span>
+        </div>
+      )}
     </>
   );
 }
