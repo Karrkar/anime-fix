@@ -136,6 +136,9 @@ async function fetchAllArtists(pid: number): Promise<ParsedList & { coverage: nu
   let okTags = 0;
   let staleTags = 0;
   const seenIds = new Set<string>();
+  // 2026-10-04: бюджет агрегата — ретрай-раунд отказавших тегов обязан
+  // уложиться вместе с чанками в maxDuration 60с (дедлайн 45с, запас на парсинг)
+  const deadline = Date.now() + 45_000;
 
   const merge = (parsed: ParsedList) => {
     for (const p of parsed.posts) {
@@ -150,11 +153,19 @@ async function fetchAllArtists(pid: number): Promise<ParsedList & { coverage: nu
 
   // 2026-10-03: вместо 14 параллельных запросов (пакет как раз и ловил блок)
   // — чанки по 5 с паузами; отказавший тег добираем из stale-кэша
+  // 2026-10-04: сначала сверяемся с 15-мин кэшем (его греют одиночные
+  // просмотры артистов) — экономия анонимного рейт-лимита Jina (20 RPM);
+  // отказавшие теги добираются ОТЛОЖЕННЫМ ретраем (окно рейт-лимита/блока
+  // стареет), и только потом — stale-кэш
   const CHUNK = 5;
+  const failed: string[] = [];
   for (let i = 0; i < ARTIST_TAGS.length; i += CHUNK) {
     const chunkTags = ARTIST_TAGS.slice(i, i + CHUNK);
     const settled = await Promise.allSettled(
       chunkTags.map(async (tag) => {
+        const cacheKey = `${tag}:${pid}`;
+        const cached = cache.get(cacheKey);
+        if (cached) return { tag, empty: false, parsed: cached };
         const url = `${R34_BASE}/index.php?page=post&s=list&tags=${encodeURIComponent(tag)}&pid=${pid}`;
         const { html, empty } = await fetchListPage(url, 'fast');
         return { tag, empty, parsed: empty ? null : parseListPage(html, tag) };
@@ -165,19 +176,51 @@ async function fetchAllArtists(pid: number): Promise<ParsedList & { coverage: nu
       if (r.status === 'fulfilled' && r.value.parsed) {
         okTags++;
         stale.set(`${tag}:${pid}`, r.value.parsed);
+        cache.set(`${tag}:${pid}`, r.value.parsed);
         merge(r.value.parsed);
       } else if (r.status === 'rejected') {
-        // источник отказал — последнее живое вместо молчаливого пропуска автора
-        const st = stale.get(`${tag}:${pid}`);
-        if (st && st.posts.length > 0) {
-          staleTags++;
-          merge(st);
-        }
+        // источник отказал — запомним для отложенного ретрая (ниже)
+        failed.push(tag);
         logEvent('r34_tag_fail', { tag, pid, err: String(r.reason).slice(0, 120) });
       }
       // «честно пустой» тег (chickens) — ничего не делаем
     });
-    if (i + CHUNK < ARTIST_TAGS.length) await sleep(400);
+    if (i + CHUNK < ARTIST_TAGS.length) await sleep(700);
+  }
+
+  // 2026-10-04: отложенный ретрай отказавших тегов — окно рейт-лимита Jina
+  // (20 RPM анонимно) успевает под состариться; последовательно, не пачкой
+  if (failed.length > 0) {
+    await sleep(3500);
+    for (let f = failed.length - 1; f >= 0; f--) {
+      const tag = failed[f];
+      if (Date.now() > deadline) break;
+      try {
+        const url = `${R34_BASE}/index.php?page=post&s=list&tags=${encodeURIComponent(tag)}&pid=${pid}`;
+        const { html, empty } = await fetchListPage(url, 'fast');
+        if (!empty) {
+          const parsed = parseListPage(html, tag);
+          okTags++;
+          stale.set(`${tag}:${pid}`, parsed);
+          cache.set(`${tag}:${pid}`, parsed);
+          merge(parsed);
+          failed.splice(f, 1); // успешный ретрай — тег больше не «отказавший»
+        }
+      } catch {
+        // остался отказавшим — доберём stale ниже
+      }
+      await sleep(900);
+    }
+  }
+
+  // финал: теги, не давшиеся даже ретраем — последнее живое вместо
+  // молчаливого пропуска автора (после ретрая, чтобы не задваивать merge)
+  for (const tag of failed) {
+    const st = stale.get(`${tag}:${pid}`);
+    if (st && st.posts.length > 0) {
+      staleTags++;
+      merge(st);
+    }
   }
 
   allPosts.sort((a, b) => b.score - a.score);
