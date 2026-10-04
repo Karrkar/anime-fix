@@ -202,6 +202,7 @@ export async function GET(request: Request) {
   // onError уже не поможет — он уходит на прямой URL, в РФ заблокированный
   try {
     let res: Response | null = null;
+    let lastUpstreamStatus = 0;
     for (let attempt = 0; attempt < 3; attempt++) {
       if (attempt > 0) await new Promise(r => setTimeout(r, 700 * attempt));
       try {
@@ -214,10 +215,15 @@ export async function GET(request: Request) {
           signal: AbortSignal.timeout(12_000),
         });
         if (res.ok) break;
+        lastUpstreamStatus = res.status;
         res = null; // не-200 — ещё попытка
-      } catch { res = null; }
+      } catch { res = null; lastUpstreamStatus = -1; }
     }
-    if (!res) return NextResponse.json({ error: 'Upstream error' }, { status: 502 });
+    if (!res) {
+      // upstreamStatus в ответе — диагностика без Runtime Logs (403 = бан
+      // egress-IP, 429 = рейт-лимит, 0/-1 = таймаут/сеть)
+      return NextResponse.json({ error: 'Upstream error', upstreamStatus: lastUpstreamStatus }, { status: 502 });
+    }
 
     const contentType = res.headers.get('content-type') || '';
     const buffer = await res.arrayBuffer();
