@@ -5,7 +5,7 @@ import { logEvent } from '@/lib/logger';
 import { notifyTelegram } from '@/lib/notify';
 import { recordSyncRun } from '@/lib/sync-status';
 import { FEELEX_BASE, XXX_IGRA_BASE, JINA_READER } from '@/lib/sources'; // F-27: домены из единого реестра
-import { jinaHeaders } from '@/lib/jina'; // 2026-10-03: ключ JINA_API_KEY снимает блок датацентровых IP
+import { jinaHeaders, markJinaKeyRejected } from '@/lib/jina'; // 2026-10-03: ключ JINA_API_KEY снимает блок датацентровых IP
 
 export const maxDuration = 60;
 
@@ -27,6 +27,9 @@ async function fetchPage(url: string, retries = 1): Promise<string> {
         signal: AbortSignal.timeout(12000),
       });
       if (r.ok) return await r.text();
+      // 2026-10-04: ключ отвергнут (401/402 — баланс/аутентификация) —
+      // следующая попытка цикла пойдёт анонимно (jinaHeaders без ключа)
+      if (r.status === 401 || r.status === 402) markJinaKeyRejected(r.status);
     } catch { /* retry */ }
     if (i < retries) await new Promise(r => setTimeout(r, 1000 * (i + 1)));
   }

@@ -20,19 +20,36 @@
  * тегах «chickens» остаётся внутри .content и честно детектится валидатором.
  */
 import { JINA_READER } from '@/lib/sources';
-import { jinaHeaders } from '@/lib/jina';
+import { jinaHeaders, markJinaKeyRejected } from '@/lib/jina';
 
 export const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
 
 async function jinaFetch(targetUrl: string, timeoutMs: number, targetSelector?: string): Promise<string> {
-  const headers = jinaHeaders(
-    targetSelector ? { 'X-Target-Selector': targetSelector } : undefined,
-  );
+  const extra = targetSelector ? { 'X-Target-Selector': targetSelector } : undefined;
+  const headers = jinaHeaders(extra);
+  const withKey = 'Authorization' in headers;
   const r = await fetch(JINA_READER + encodeURIComponent(targetUrl), {
     headers,
     signal: AbortSignal.timeout(timeoutMs),
   });
-  if (!r.ok) throw new Error(`jina http ${r.status}`);
+  if (!r.ok) {
+    // 2026-10-04 fix «арты вообще не грузятся»: ключ с нулевым балансом
+    // (402) или убитой аутентификацией (401) рвал ВСЮ цепочку. Отмечаем
+    // ключ мёртвым и немедленно ретраим ту же попытку анонимно — частичный
+    // доступ лучше полного нуля. Дальнейшие вызовы jinaHeaders() уже
+    // пойдут без Authorization (30-минутный кулдаун в lib/jina).
+    if (withKey && (r.status === 401 || r.status === 402)) {
+      markJinaKeyRejected(r.status);
+      const anonHeaders = jinaHeaders(extra);
+      const r2 = await fetch(JINA_READER + encodeURIComponent(targetUrl), {
+        headers: anonHeaders,
+        signal: AbortSignal.timeout(timeoutMs),
+      });
+      if (r2.ok) return r2.text();
+      throw new Error(`jina http ${r2.status} (anon fallback)`);
+    }
+    throw new Error(`jina http ${r.status}`);
+  }
   return r.text();
 }
 

@@ -4,7 +4,7 @@ import { withRateLimit } from '@/lib/with-rate-limit';
 import { BoundedTTLCache } from '@/lib/cache';
 import { logEvent } from '@/lib/logger';
 import { PLAYER_PROXY_ALLOWED_HOSTS as ALLOWED_HOSTS, JINA_READER, isAllowedVostVideoHost } from '@/lib/sources'; // F-27
-import { jinaHeaders } from '@/lib/jina'; // 2026-10-03: ключ JINA_API_KEY снимает блок датацентровых IP
+import { jinaHeaders, markJinaKeyRejected } from '@/lib/jina'; // 2026-10-03: ключ JINA_API_KEY снимает блок датацентровых IP
 import { extractVostId, fetchSeriesFromApi } from '@/lib/vost-series'; // ФИКС 26.09.2026: серии через API animevost
 import {
   loadCachedPage,
@@ -168,6 +168,9 @@ async function fetchViaJina(url: string, timeoutMs: number, diag?: ChannelDiag):
       signal: AbortSignal.timeout(timeoutMs),
     });
     if (!resp.ok) {
+      // 2026-10-04: ключ отвергнут (401/402) — помечаем мёртвым, следующий
+      // запрос двухканальной схемы пойдёт анонимно
+      if (resp.status === 401 || resp.status === 402) markJinaKeyRejected(resp.status);
       if (diag) diag.jinaResult = `http-${resp.status}`;
       return null;
     }

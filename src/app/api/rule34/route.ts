@@ -228,19 +228,19 @@ export async function GET(request: Request) {
         }
         if (fresh.posts.length === 0) {
           return NextResponse.json(
-            { error: 'Source unavailable', posts: [], total: 0, page, totalPages: 0, tags: 'all' },
+            { error: 'Source unavailable', detail: `coverage ${fresh.coverage.toFixed(2)}`, posts: [], total: 0, page, totalPages: 0, tags: 'all' },
             { status: 502 }
           );
         }
         return NextResponse.json({ posts: fresh.posts, total: fresh.totalPosts, page, totalPages: fresh.totalPages, tags: 'all' });
       }
       return NextResponse.json({ posts: st.posts, total: st.totalPosts, page, totalPages: st.totalPages, tags: 'all' });
-    } catch {
+    } catch (e) {
       const st = stale.get(cacheKey);
       if (st) {
         return NextResponse.json({ posts: st.posts, total: st.totalPosts, page, totalPages: st.totalPages, tags: 'all' }, { headers: { 'X-Data-Stale': '1' } });
       }
-      return NextResponse.json({ error: 'Source unavailable', posts: [], total: 0, page, totalPages: 0, tags: 'all' }, { status: 502 });
+      return NextResponse.json({ error: 'Source unavailable', detail: String(e).slice(0, 140), posts: [], total: 0, page, totalPages: 0, tags: 'all' }, { status: 502 });
     }
   }
 
@@ -278,6 +278,6 @@ export async function GET(request: Request) {
     if (st) {
       return NextResponse.json({ posts: st.posts, total: st.totalPosts, page, totalPages: st.totalPages, tags }, { headers: { 'X-Data-Stale': '1' } });
     }
-    return NextResponse.json({ error: 'Source unavailable', posts: [], total: 0, page, totalPages: 0, tags }, { status: 502 });
+    return NextResponse.json({ error: 'Source unavailable', detail: String(e).slice(0, 140), posts: [], total: 0, page, totalPages: 0, tags }, { status: 502 });
   }
 }
