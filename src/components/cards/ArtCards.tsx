@@ -1,22 +1,62 @@
 'use client';
 
-import { useState } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import Image from 'next/image';
 import { Heart, Star, ImageIcon, Video } from 'lucide-react';
 import { ArtItem } from '@/lib/client-types';
-import { BLUR_DATA_URL } from '@/lib/client-utils';
+import { BLUR_DATA_URL, hedgeLoadImage } from '@/lib/client-utils';
 
 export function Rule34ArtCard({ art, isVideo, onClick }: { art: ArtItem; isVideo?: boolean; onClick: () => void }) {
   const [imgError, setImgError] = useState(false);
   const [imgLoaded, setImgLoaded] = useState(false);
   const proxyUrl = art.imageUrl ? `/api/r34img?url=${encodeURIComponent(art.imageUrl)}` : '';
-  // PROXY-FIRST: домен rule34.xxx (вкл. CDN wimg.*) заблокирован провайдерами РФ —
-  // прямой <img src=wimg...> у значительной части аудитории гарантированно падает
-  // (таймаут до ~75с), и только потом срабатывал фолбэк на прокси. Грузим сразу
-  // через прокси (кэш 30 мин на сервере), прямой URL оставляем как запасной путь.
-  const [useDirect, setUseDirect] = useState(false);
-  const imgSrc = useDirect ? (art.imageUrl || '') : proxyUrl;
+  // PROXY-FIRST + ХЕДЖ-РЕТРАЙ (2026-10-08): прямой CDN rule34 заблокирован в РФ,
+  // а прокси /api/r34img выборочно 502 — Cloudflare банит egress-IP ~40-70%
+  // инстансов Vercel. Первый шаг как раньше — <img loading="lazy"> через прокси
+  // (нативный lazy + HTTP-кэш браузера); при ошибке — ОДНА волна из 3 параллельных
+  // fetch того же URL (попадают на разные инстансы, ~97% успеха), и только если
+  // она не помогла — прямой CDN, и лишь затем заглушка.
+  const [displaySrc, setDisplaySrc] = useState(proxyUrl);
+  const hedgeStateRef = useRef<'none' | 'pending' | 'done'>('none');
+  const blobRef = useRef('');
+
+  // Освобождаем blob при размонтировании карточки
+  useEffect(() => () => {
+    if (blobRef.current) URL.revokeObjectURL(blobRef.current);
+  }, []);
+
+  const handleError = () => {
+    if (hedgeStateRef.current === 'pending') return;
+    if (hedgeStateRef.current === 'none' && proxyUrl) {
+      hedgeStateRef.current = 'pending';
+      hedgeLoadImage(proxyUrl, { waves: 1, perWave: 3, timeoutMs: 12_000 })
+        .then(u => {
+          blobRef.current = u;
+          hedgeStateRef.current = 'done';
+          setImgLoaded(false);
+          setDisplaySrc(u);
+        })
+        .catch(() => {
+          if (!art.imageUrl) { setImgError(true); return; }
+          // Последний шанс — прямой CDN, но с коротким таймаутом через fetch:
+          // в РФ он откажется за ~6с (а <img> висел бы с шиммером до 75с),
+          // для VPN/зарубежных — реально работает
+          hedgeStateRef.current = 'pending';
+          hedgeLoadImage(art.imageUrl, { waves: 0, perWave: 1, timeoutMs: 6_000 })
+            .then(u => {
+              blobRef.current = u;
+              hedgeStateRef.current = 'done';
+              setImgLoaded(false);
+              setDisplaySrc(u);
+            })
+            .catch(() => setImgError(true));
+        });
+    } else if (hedgeStateRef.current === 'done') {
+      setImgError(true);
+    }
+  };
+
   return (
     <motion.div
       whileHover={{ y: -3, scale: 1.02 }}
@@ -27,21 +67,17 @@ export function Rule34ArtCard({ art, isVideo, onClick }: { art: ArtItem; isVideo
     >
       <div className="relative aspect-square overflow-hidden" style={{ background: 'linear-gradient(160deg, #1a0a14 0%, #2d1030 50%, #1a0a14 100%)' }}>
         {/* Shimmer placeholder while loading */}
-        {!imgLoaded && !imgError && imgSrc && (
+        {!imgLoaded && !imgError && displaySrc && (
           <div className="absolute inset-0 art-card-shimmer" />
         )}
-        {!imgError && imgSrc ? (
+        {!imgError && displaySrc ? (
           <img
-            src={imgSrc}
+            src={displaySrc}
             alt={art.title}
-            referrerPolicy={useDirect ? 'no-referrer' : undefined}
             className={`w-full h-full object-cover group-hover:scale-105 transition-all duration-500 ${imgLoaded ? 'opacity-100' : 'opacity-0'}`}
             loading="lazy"
             onLoad={() => setImgLoaded(true)}
-            onError={() => {
-              if (!useDirect) { setUseDirect(true); setImgLoaded(false); }
-              else { setImgError(true); }
-            }}
+            onError={handleError}
           />
         ) : (
           <div className="w-full h-full flex flex-col items-center justify-center gap-2 p-3 text-center" style={{ background: 'linear-gradient(160deg, #1a0a14 0%, #2d1030 50%, #1a0a14 100%)' }}>

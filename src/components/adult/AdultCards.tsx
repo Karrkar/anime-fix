@@ -1,11 +1,11 @@
 'use client';
 
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import Image from 'next/image';
 import { Heart, Play, Film, Clock4, ImageIcon } from 'lucide-react';
 import { Anime } from '@/lib/client-types';
-import { BLUR_DATA_URL, parseGenres } from '@/lib/client-utils';
+import { BLUR_DATA_URL, parseGenres, hedgeLoadImage } from '@/lib/client-utils';
 
 export function HentaiCard({ anime, onOpen, onFav, isFav }: {
   anime: Anime; onOpen: (id: string) => void; onFav: (id: string) => void; isFav: boolean;
@@ -77,72 +77,108 @@ export function HentaiCard({ anime, onOpen, onFav, isFav }: {
 
 /* ──────────────────── Art Viewer Image ──────────────────── */
 export function ArtViewerImage({ fullImgUrl, thumbnailUrl, title }: { fullImgUrl: string; thumbnailUrl: string; title: string }) {
-  // 2026-10-04 fix «чёрный экран на телефоне»: ВСЯ графика — через прокси.
-  // Раньше превью-миниатюра и фолбэк при пустой деталке шли ПРЯМЫМ URL на CDN
-  // rule34 (wimg.* и т.п.), который у мобильных провайдеров РФ заблокирован —
-  // лайтбокс открывался в пустоту: чёрный фон без единого пикселя. Сетка
-  // при этом работала (Rule34ArtCard уже ходит через /api/r34img) —
-  // несоответствие «сетка есть, просмотр пустой» и был симптомом.
-  const [imgError, setImgError] = useState(false);
-  const [useDirect, setUseDirect] = useState(false);
-  const [thumbDirect, setThumbDirect] = useState(false);
-  const [showThumb, setShowThumb] = useState(true);
-
+  // 2026-10-08, фикс «чёрный экран арта на мобильных» (финальная версия):
+  //
+  // СИМПТОМ: на телефонах лайтбокс открывался в чёрный фон — картинка не
+  // появлялась минутами или никогда, при этом сетка артов работала.
+  //
+  // КОРЕНЬ (3 слоя, все подтверждены диагностикой в проде):
+  //   1) CDN rule34 (Cloudflare) банит egress-IP ~40-70% инстансов Vercel →
+  //      /api/r34img отдаёт 502 выборочно по инстансам;
+  //   2) прошлый фолбэк на ПРЯМОЙ CDN (wimg.*) в РФ заблокирован провайдерами —
+  //      <img> висит до TCP-таймаута (~75с) без onError → «вечный» чёрный экран;
+  //   3) деталка /api/rule34-post мертва без Jina (баланс 402) → полного URL нет.
+  //
+  // ЛЕЧЕНИЕ: вся загрузка через fetch (таймауты управляемы!) волнами
+  // hedgeLoadImage — параллельные запросы распределяются по разным инстансам
+  // Vercel, первый 200 побеждает (P≈97% на волну из 4), успех оседает в кэшах.
+  // Прямой CDN — только последний шанс с коротким таймаутом (VPN/зарубежные),
+  // в РФ он отклоняется за секунды, а не висит минутами.
   const proxied = (u: string) => `/api/r34img?url=${encodeURIComponent(u)}`;
 
-  let src = '';
-  if (fullImgUrl && !imgError) {
-    src = useDirect ? fullImgUrl : proxied(fullImgUrl);
-  } else if (thumbnailUrl) {
-    // фолбэк: хотя бы миниатюра, тоже через прокси (прямой CDN в РФ мёртв)
-    src = thumbDirect ? thumbnailUrl : proxied(thumbnailUrl);
-  }
+  const [previewSrc, setPreviewSrc] = useState('');
+  const [mainSrc, setMainSrc] = useState('');
+  const [failed, setFailed] = useState(false);
+  const [loading, setLoading] = useState(true);
+  const [retryNonce, setRetryNonce] = useState(0);
 
-  const previewSrc = thumbnailUrl
-    ? (thumbDirect ? thumbnailUrl : proxied(thumbnailUrl))
-    : '';
+  useEffect(() => {
+    let alive = true;
+    const blobs: string[] = [];
+    const keep = (u: string) => { blobs.push(u); return u; };
+
+    setFailed(false);
+    setLoading(true);
+
+    (async () => {
+      // 1) Размытая миниатюра-превью — сразу (в HTTP-кэше браузера от грида),
+      //    чтобы вместо чёрного экрана моментально было хоть что-то
+      if (thumbnailUrl) {
+        hedgeLoadImage(proxied(thumbnailUrl), { waves: 1, perWave: 3, timeoutMs: 12_000 })
+          .then(u => { if (alive) setPreviewSrc(keep(u)); })
+          .catch(() => { /* превью не критично */ });
+      }
+
+      // 2) Основная цепочка: полная через прокси → миниатюра через прокси →
+      //    прямой CDN с коротким таймаутом
+      const chain: Array<[string, number]> = [];
+      if (fullImgUrl) chain.push([proxied(fullImgUrl), 15_000]);
+      if (thumbnailUrl) chain.push([proxied(thumbnailUrl), 12_000]);
+      const directUrl = fullImgUrl || thumbnailUrl;
+      if (directUrl) chain.push([directUrl, 6_000]); // для VPN/зарубежных; в РФ быстро откажется
+
+      for (const [u, ms] of chain) {
+        try {
+          const blobUrl = await hedgeLoadImage(u, { waves: 2, perWave: 4, timeoutMs: ms });
+          if (!alive) { URL.revokeObjectURL(blobUrl); return; }
+          setMainSrc(keep(blobUrl));
+          setLoading(false);
+          return;
+        } catch { /* следующий этап цепочки */ }
+      }
+      if (alive) { setFailed(true); setLoading(false); }
+    })();
+
+    return () => {
+      alive = false;
+      blobs.forEach(u => URL.revokeObjectURL(u));
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [fullImgUrl, thumbnailUrl, retryNonce]);
 
   return (
     <>
-      {/* Размытая миниатюра сразу — пока полноразмерный арт грузится/рендерится
-          (деталка через Jina занимает до ~20с, миниатюра уже в кэше прокси
-          от грида — она появляется мгновенно вместо чёрного экрана) */}
-      {showThumb && previewSrc && (
+      {/* Размытая миниатюра, пока грузится основная картинка */}
+      {previewSrc && !mainSrc && (
         <img
           src={previewSrc}
           alt={title}
-          referrerPolicy="no-referrer"
           className="absolute max-w-[200px] max-h-[200px] object-contain rounded-lg opacity-40 blur-sm"
-          onError={() => {
-            if (!thumbDirect) setThumbDirect(true);
-          }}
         />
       )}
-      {src && (
+      {loading && !mainSrc && !previewSrc && (
+        <div className="flex flex-col items-center gap-3">
+          <div className="w-8 h-8 border-2 border-pink-500/30 border-t-pink-500 rounded-full animate-spin" />
+          <span className="text-xs text-white/50">Загрузка...</span>
+        </div>
+      )}
+      {mainSrc && (
         <img
-          key={src}
-          src={src}
+          src={mainSrc}
           alt={title}
-          referrerPolicy={(useDirect && fullImgUrl && !imgError) ? 'no-referrer' : undefined}
           className="max-w-full max-h-full object-contain select-none relative z-[1]"
-          onLoad={() => setShowThumb(false)}
-          onError={() => {
-            if (fullImgUrl && !imgError) {
-              if (!useDirect) { setUseDirect(true); }
-              else { setImgError(true); }
-            } else if (!thumbDirect) {
-              // миниатюра через прокси не прошла — пробуем прямой CDN
-              setThumbDirect(true);
-            }
-            setShowThumb(false);
-          }}
         />
       )}
-      {/* Ничего не загрузилось совсем — честная заглушка вместо пустоты */}
-      {!src && !previewSrc && (
-        <div className="flex flex-col items-center gap-2 text-white/40">
-          <ImageIcon className="w-10 h-10" />
-          <span className="text-xs">Не удалось загрузить изображение</span>
+      {failed && (
+        <div className="flex flex-col items-center gap-3 px-4 text-center">
+          <ImageIcon className="w-10 h-10 text-pink-400/40" />
+          <span className="text-xs text-white/50">Не удалось загрузить изображение</span>
+          <button
+            onClick={() => setRetryNonce(n => n + 1)}
+            className="px-4 py-1.5 rounded-full bg-pink-500/20 hover:bg-pink-500/30 border border-pink-500/30 text-pink-200 text-xs font-medium transition-colors"
+          >
+            Повторить
+          </button>
         </div>
       )}
     </>

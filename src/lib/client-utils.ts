@@ -41,6 +41,82 @@ export function authHeaders(): Record<string, string> {
   return token ? { 'Authorization': `Bearer ${token}` } : {};
 }
 
+// ─── Hedged image loading (2026-10-08, фикс «чёрный экран арта») ─────────
+/**
+ * CDN rule34 (за Cloudflare) банит egress-IP ~40-70% serverless-инстансов
+ * Vercel → /api/r34img отвечает 502 выборочно и НЕЗАВИСИМО по инстансам.
+ * Эксперимент: 15 параллельных запросов одного URL → 9 прошли; повторная
+ * волна через секунду → 15/15 (успех оседает в кэшах: инстанс + браузер).
+ *
+ * hedgeLoadImage грузит картинку «волнами» против этого:
+ *   1) одиночный fetch — быстрый путь (кэш браузера / удачный инстанс);
+ *   2) при отказе — волна из perWave ПАРАЛЛЕЛЬНЫХ fetch того же URL:
+ *      они распределяются по разным инстансам, первый 200 побеждает,
+ *      остальные прерываются; P(успех волны из 4) при 60% здоровых ≈ 97%.
+ *
+ * Возвращает blob:-URL — вызывающий код ОБЯЗАН вызвать URL.revokeObjectURL,
+ * когда картинка больше не нужна (unmount / замена).
+ */
+function fetchWithTimeout(url: string, ms: number, outer?: AbortSignal): Promise<Response> {
+  // AbortSignal.timeout недоступен в старых Safari (15.3-) — ручной таймаут
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), ms);
+  const onOuterAbort = () => ctrl.abort();
+  if (outer) {
+    if (outer.aborted) ctrl.abort();
+    else outer.addEventListener('abort', onOuterAbort, { once: true });
+  }
+  return fetch(url, { signal: ctrl.signal, cache: 'default' }).finally(() => {
+    clearTimeout(timer);
+    if (outer) outer.removeEventListener('abort', onOuterAbort);
+  });
+}
+
+export interface HedgeOpts {
+  /** Волн параллельных запросов после одиночной попытки (по умолчанию 2). */
+  waves?: number;
+  /** Запросов в волне (по умолчанию 4). */
+  perWave?: number;
+  /** Таймаут одного запроса, мс (по умолчанию 15000). */
+  timeoutMs?: number;
+}
+
+export async function hedgeLoadImage(url: string, opts: HedgeOpts = {}): Promise<string> {
+  const { waves = 2, perWave = 4, timeoutMs = 15_000 } = opts;
+
+  // Быстрый путь: один запрос — кэш или счастливый инстанс
+  try {
+    const r = await fetchWithTimeout(url, timeoutMs);
+    if (r.ok) return URL.createObjectURL(await r.blob());
+  } catch { /* уходим в волны */ }
+
+  for (let w = 0; w < waves; w++) {
+    const controllers = Array.from({ length: perWave }, () => new AbortController());
+    const attempts = controllers.map(c =>
+      fetchWithTimeout(url, timeoutMs, c.signal).then(r => {
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        return r.blob();
+      })
+    );
+    // Promise.any (ES2021) с фолбэком на последовательный перебор для старых браузеров
+    const anyOf: Promise<Blob> = typeof (Promise as unknown as { any?: Function }).any === 'function'
+      ? (Promise as unknown as { any: (p: Promise<Blob>[]) => Promise<Blob> }).any(attempts)
+      : (async () => {
+          let lastErr: unknown;
+          for (const p of attempts) { try { return await p; } catch (e) { lastErr = e; } }
+          throw lastErr || new Error('all failed');
+        })();
+    try {
+      const blob = await anyOf;
+      controllers.forEach(c => c.abort()); // прерываем проигравших
+      return URL.createObjectURL(blob);
+    } catch {
+      await new Promise(r => setTimeout(r, 350 + w * 350)); // пауза перед следующей волной
+    }
+  }
+  throw new Error(`hedge failed: ${url.slice(0, 60)}`);
+}
+
 // F-PERF: эти GET-эндпоинты публичные (сервер авторизацию не проверяет), а
 // запрос с заголовком Authorization CDN Vercel принципиально НЕ кэширует —
 // залогиненные пользователи оставались без edge-ускорения. Cookie всё равно
