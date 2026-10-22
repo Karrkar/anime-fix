@@ -4,16 +4,40 @@ import { isCronAuthorized } from '@/lib/cron-auth';
 import { logEvent } from '@/lib/logger';
 import { notifyTelegram } from '@/lib/notify';
 import { recordSyncRun } from '@/lib/sync-status';
-import { FEELEX_BASE, XXX_IGRA_BASE, JINA_READER } from '@/lib/sources'; // F-27: домены из единого реестра
-import { jinaHeaders, markJinaKeyRejected } from '@/lib/jina'; // 2026-10-03: ключ JINA_API_KEY снимает блок датацентровых IP
+import { FEELEX_BASE, XXX_IGRA_BASE, JINA_READER } from '@/lib/sources'; // F-27: единый реестр
+import { jinaHeaders, markJinaKeyRejected } from '@/lib/jina';
+import { buildChainUrl, fireChainNext } from '@/lib/sync-chain';
 
 export const maxDuration = 60;
 
 /**
- * Парсер 18+ игр с feelex.fun и xxx-igra.com
- * Ручной запуск: GET /api/sync-games?secret=<SYNC_SECRET|CRON_SECRET>
- * (при желании можно добавить в vercel.json как крон — авторизация уже готова)
+ * Парсер 18+ игр с feelex.fun и xxx-igra.com.
+ *
+ * ОКТЯБРЬ 2026 — задача «весь контент без ограничений». Зондирование
+ * источников показало ДЫРУ в покрытии:
+ *   feelex.fun — у каждой из 12 категорий ЕСТЬ пагинация ?page=2..7
+ *     (проверено: на странице hentai 46 карточек, страница 2 добавляет
+ *     39 новых), а парсер ходил только по 1-й странице каждой категории;
+ *   xxx-igra.com — пагинация index.php?page=2..86 при ~6-12 играх на
+ *     страницу (~500-1000 игр на сайте), парсер брал ТОЛЬКО главную.
+ *     В БД на момент фикса было 45 игр xxx-igra — покрытие ~4%!
+ *
+ * Теперь обычный режим как раньше (1-я страница каждой категории feelex +
+ * главная xxx-igra, они покрывают свежий контент), а ГЛУБОКИЙ проход
+ * архива «по датам» делает бэкфил-режим: резюмируемый курсор в
+ * sync_status ('games_backfill') + самоцепочка (lib/sync-chain.ts),
+ * батч-апсерт целой страницы одним запросом (UNIQUE на vost_id
+ * подтверждён продовой). Порядок фаз: сначала xxx-igra (самая большая
+ * дыра), затем feelex по категориям.
  */
+
+const BACKFILL_SOURCE = 'games_backfill';
+const FEELEX_CATEGORIES = [
+  'hentai', '2d', '3d', 'rpg', 'simulation', 'visual-novel',
+  'ren-py', 'html5', 'action', 'adventure', 'dating', 'puzzle',
+] as const;
+const XXX_PAGE_HARD_CAP = 120;
+const FEELEX_PAGE_HARD_CAP = 30;
 
 // ⚠️ Бюджет времени: у функции жёсткий лимит 60с (Hobby-план Vercel), и раньше
 // синк игр регулярно убивало по таймауту (504 FUNCTION_INVOCATION_TIMEOUT) —
@@ -27,8 +51,6 @@ async function fetchPage(url: string, retries = 1): Promise<string> {
         signal: AbortSignal.timeout(12000),
       });
       if (r.ok) return await r.text();
-      // 2026-10-04: ключ отвергнут (401/402 — баланс/аутентификация) —
-      // следующая попытка цикла пойдёт анонимно (jinaHeaders без ключа)
       if (r.status === 401 || r.status === 402) markJinaKeyRejected(r.status);
     } catch { /* retry */ }
     if (i < retries) await new Promise(r => setTimeout(r, 1000 * (i + 1)));
@@ -112,31 +134,337 @@ async function fetchXxxIgraDescription(gameUrl: string): Promise<string> {
   return desc ? desc[1].slice(0, 500) : '';
 }
 
+// Simple string hash (deterministic, for dedup)
+function hashCode(str: string): number {
+  let hash = 0;
+  for (let i = 0; i < str.length; i++) {
+    const char = str.charCodeAt(i);
+    hash = ((hash << 5) - hash) + char;
+    hash |= 0; // Convert to 32bit integer
+  }
+  return -Math.abs(hash) - 10000; // Negative to avoid collision with vost.pw IDs
+}
+
+// ─── Состояние бэкфилла игр (свой shape: два подисточника) ────────
+interface GamesBackfillState {
+  feelex: Record<string, number>;   // категория → следующая страница
+  feelex_streak: Record<string, number>; // подряд пустых страниц категории
+  feelex_done: Record<string, boolean>;
+  xxx_next: number;
+  xxx_streak: number;
+  xxx_done: boolean;
+  inserted: number;
+  updated: number;
+  pages_done: number;
+  finished_at?: string;
+  note?: string;
+}
+
+async function loadGamesState(): Promise<GamesBackfillState> {
+  const fresh: GamesBackfillState = {
+    feelex: {}, feelex_streak: {}, feelex_done: {},
+    xxx_next: 2, xxx_streak: 0, xxx_done: false,
+    inserted: 0, updated: 0, pages_done: 0,
+  };
+  try {
+    const db = getDb();
+    const { data } = await db.from('sync_status').select('details').eq('source', BACKFILL_SOURCE).maybeSingle();
+    const d = (data?.details as Partial<GamesBackfillState> | null) || {};
+    return {
+      feelex: d.feelex && typeof d.feelex === 'object' ? d.feelex : {},
+      feelex_streak: d.feelex_streak && typeof d.feelex_streak === 'object' ? d.feelex_streak : {},
+      feelex_done: d.feelex_done && typeof d.feelex_done === 'object' ? d.feelex_done : {},
+      xxx_next: Number(d.xxx_next) >= 2 ? Math.floor(Number(d.xxx_next)) : 2,
+      xxx_streak: Number(d.xxx_streak) || 0,
+      xxx_done: d.xxx_done === true,
+      inserted: Number(d.inserted) || 0,
+      updated: Number(d.updated) || 0,
+      pages_done: Number(d.pages_done) || 0,
+      finished_at: d.finished_at,
+      note: d.note,
+    };
+  } catch {
+    return fresh;
+  }
+}
+
+async function saveGamesState(st: GamesBackfillState): Promise<void> {
+  try {
+    const db = getDb();
+    const { error } = await db.from('sync_status').upsert({
+      source: BACKFILL_SOURCE,
+      last_run_at: new Date().toISOString(),
+      last_status: 'ok',
+      new_items: st.inserted,
+      updated_items: st.updated,
+      details: st as unknown as Record<string, unknown>,
+      error: null,
+    }, { onConflict: 'source' });
+    if (error) console.error(`saveGamesState:`, error.message);
+  } catch (e) {
+    console.error('saveGamesState failed:', e);
+  }
+}
+
+/** Существующие id игр (type='Игра', hash-отрицательные). */
+async function loadExistingGameIds(db: ReturnType<typeof getDb>): Promise<Set<number>> {
+  const ids = new Set<number>();
+  const PAGE = 1000;
+  for (let offset = 0; offset < 10_000; offset += PAGE) {
+    const { data, error } = await db
+      .from('anime_catalog')
+      .select('vost_id')
+      .eq('type', 'Игра')
+      .range(offset, offset + PAGE - 1);
+    if (error) throw error;
+    for (const r of (data || []) as { vost_id: number }[]) ids.add(r.vost_id);
+    if (!data || data.length < PAGE) break;
+  }
+  return ids;
+}
+
+function gameRow(g: GameData, updatedAt: string) {
+  const isFeelex = g.source === 'feelex';
+  return {
+    vost_id: hashCode(g.sourceUrl),
+    title: g.title,
+    title_russian: g.title,
+    description: g.description,
+    image_url: g.imageUrl,
+    type: 'Игра',
+    episodes: 0,
+    genres: isFeelex ? 'игра, 18+, хентай, feelex' : 'игра, 18+, xxx-igra',
+    year: 2026,
+    score: 0,
+    views: 0,
+    source_url: g.sourceUrl,
+    embed_url: g.sourceUrl,
+    is_adult: true,
+    updated_at: updatedAt,
+  };
+}
+
+/** Один сегмент: сначала xxx-igra (крупнейшая дыра), затем feelex. */
+async function runGamesBackfillSegment(
+  db: ReturnType<typeof getDb>,
+  st: GamesBackfillState,
+  budgetPages: number,
+  deadlineMs: number,
+): Promise<{ pagesWalked: number; inserted: number; updated: number }> {
+  let existingIds: Set<number>;
+  try {
+    existingIds = await loadExistingGameIds(db);
+  } catch {
+    existingIds = new Set();
+  }
+
+  let pagesWalked = 0;
+  let segInserted = 0, segUpdated = 0;
+  let fetchFails = 0;
+
+  while (pagesWalked < budgetPages && Date.now() < deadlineMs) {
+    let url = '';
+    let source: 'xxx' | 'feelex' | null = null;
+    let cat = '';
+
+    // ── Фаза 1: xxx-igra (index.php?page=N, на сайте 86 страниц) ──────
+    if (!st.xxx_done) {
+      if (st.xxx_next > XXX_PAGE_HARD_CAP) {
+        st.xxx_done = true;
+        continue;
+      }
+      url = `${XXX_IGRA_BASE}/index.php?page=${st.xxx_next}`;
+      source = 'xxx';
+    } else {
+      // ── Фаза 2: feelex по категориям (страницы 2..7 каждой) ──────────
+      const pendingCat = FEELEX_CATEGORIES.find(c => !st.feelex_done[c]);
+      if (!pendingCat) break; // всё пройдено
+      cat = pendingCat;
+      const nextPage = Math.max(2, Number(st.feelex[cat]) || 2);
+      if (nextPage > FEELEX_PAGE_HARD_CAP) {
+        st.feelex_done[cat] = true;
+        continue;
+      }
+      st.feelex[cat] = nextPage;
+      url = `${FEELEX_BASE}/ru/games/${cat}?page=${nextPage}`;
+      source = 'feelex';
+    }
+
+    const html = await fetchPage(url);
+    if (!html || html.length < 5000) {
+      fetchFails++;
+      if (fetchFails >= 3) {
+        console.log(`Backfill games: fetch failed x${fetchFails} at ${url}, stopping segment`);
+        break;
+      }
+      continue;
+    }
+    fetchFails = 0;
+
+    const games = source === 'xxx' ? parseXxxIgra(html) : parseFeelex(html);
+
+    if (source === 'xxx') {
+      if (games.length === 0) {
+        st.xxx_streak++;
+        console.log(`Backfill xxx-igra: page ${st.xxx_next} — 0 games (streak ${st.xxx_streak})`);
+        if (st.xxx_streak >= 2) {
+          st.xxx_done = true;
+          continue;
+        }
+        st.xxx_next++;
+        st.pages_done++;
+        pagesWalked++;
+        await saveGamesState(st);
+        continue;
+      }
+      const updatedAt = new Date().toISOString();
+      const rows = games.map(g => gameRow(g, updatedAt));
+      const { error: upErr } = await db.from('anime_catalog').upsert(rows, { onConflict: 'vost_id' });
+      if (upErr) {
+        console.error(`Backfill xxx page ${st.xxx_next} upsert:`, upErr.message);
+        break;
+      }
+      let pIns = 0, pUpd = 0;
+      for (const g of games) {
+        const key = hashCode(g.sourceUrl);
+        if (existingIds.has(key)) pUpd++;
+        else { pIns++; existingIds.add(key); }
+      }
+      segInserted += pIns; segUpdated += pUpd;
+      st.inserted += pIns; st.updated += pUpd;
+      console.log(`Backfill xxx-igra: page ${st.xxx_next} upsert ${games.length} (new ${pIns}, upd ${pUpd})`);
+      st.xxx_next++;
+      st.xxx_streak = 0;
+      st.pages_done++;
+      pagesWalked++;
+      await saveGamesState(st);
+      await new Promise(r => setTimeout(r, 2000));
+      continue;
+    }
+
+    // feelex: категория = cat
+    if (games.length === 0) {
+      const streak = (Number(st.feelex_streak[cat]) || 0) + 1;
+      st.feelex_streak[cat] = streak;
+      console.log(`Backfill feelex/${cat}: page ${st.feelex[cat]} — 0 games (streak ${streak})`);
+      if (st.feelex_streak[cat] >= 2) {
+        st.feelex_done[cat] = true;
+        continue;
+      }
+      st.feelex[cat] = (Number(st.feelex[cat]) || 2) + 1;
+      st.pages_done++;
+      pagesWalked++;
+      await saveGamesState(st);
+      continue;
+    }
+    const updatedAt = new Date().toISOString();
+    const rows = games.map(g => gameRow(g, updatedAt));
+    const { error: upErr } = await db.from('anime_catalog').upsert(rows, { onConflict: 'vost_id' });
+    if (upErr) {
+      console.error(`Backfill feelex/${cat} page ${st.feelex[cat]} upsert:`, upErr.message);
+      break;
+    }
+    let pIns = 0, pUpd = 0;
+    for (const g of games) {
+      const key = hashCode(g.sourceUrl);
+      if (existingIds.has(key)) pUpd++;
+      else { pIns++; existingIds.add(key); }
+    }
+    segInserted += pIns; segUpdated += pUpd;
+    st.inserted += pIns; st.updated += pUpd;
+    console.log(`Backfill feelex/${cat}: page ${st.feelex[cat]} upsert ${games.length} (new ${pIns}, upd ${pUpd})`);
+    st.feelex[cat] = (Number(st.feelex[cat]) || 2) + 1;
+    st.feelex_streak[cat] = 0;
+    st.pages_done++;
+    pagesWalked++;
+    await saveGamesState(st);
+    await new Promise(r => setTimeout(r, 2000));
+  }
+
+  return { pagesWalked, inserted: segInserted, updated: segUpdated };
+}
+
 export async function GET(request: Request) {
-  // F-01 fix: единая cron-авторизация (x-vercel-cron / Bearer CRON_SECRET / ?secret=...)
-  // Аудит 27.09.2026: + админ-сессия — для watchdog/ручного запуска.
+  // F-01 fix: единая cron-авторизация + админ-сессия (аудит 27.09.2026).
   const user = await authFromRequest(request);
   const isAdmin = !!user && user.role === 'admin';
   if (!isCronAuthorized(request) && !isAdmin) {
     return NextResponse.json({ error: 'Forbidden' }, { status: 403 });
   }
 
+  const { searchParams } = new URL(request.url);
+  const startedAt = Date.now();
+
+  // ── РЕЖИМ БЭКФИЛЛА ────────────────────────────────────────────────────
+  if (searchParams.has('from_page') || searchParams.get('backfill') === '1') {
+    const state = await loadGamesState();
+    const budgetPages = Math.max(1, Math.min(parseInt(searchParams.get('budget_pages') || '10', 10) || 10, 16));
+    const hop = Math.max(1, Math.min(parseInt(searchParams.get('hop') || '1', 10) || 1, 200));
+    const chainOn = searchParams.get('chain') !== '0';
+    const MAX_HOPS = 30; // ~86 стр xxx + до 84 стр feelex при ~10/сегмент
+
+    const allDoneBefore = state.xxx_done && FEELEX_CATEGORIES.every(c => state.feelex_done[c]);
+    const db = getDb();
+    const deadline = startedAt + 44_000;
+    const seg = await runGamesBackfillSegment(db, state, budgetPages, deadline);
+
+    const xxxDone = state.xxx_done;
+    const feelexDone = FEELEX_CATEGORIES.every(c => state.feelex_done[c]);
+    const allDone = xxxDone && feelexDone;
+    if (allDone && !allDoneBefore) {
+      state.finished_at = new Date().toISOString();
+      state.note = 'обход xxx-igra и feelex завершён';
+    }
+    await saveGamesState(state);
+    logEvent('cron_sync_games_backfill', {
+      hop, pagesWalked: seg.pagesWalked, inserted: seg.inserted, updated: seg.updated,
+      xxx_next: state.xxx_next, xxx_done: xxxDone, feelex_done: feelexDone,
+    });
+
+    if (allDone && !allDoneBefore) {
+      await notifyTelegram(
+        `🏁 Бэкфилл игр завершён: страниц ${state.pages_done}, новых игр ${state.inserted}, обновлено ${state.updated}.` +
+        `\nxxx-igra и feelex пройдены полностью.`,
+      );
+    }
+
+    let chained = false;
+    if (!allDone && chainOn && hop < MAX_HOPS && seg.pagesWalked > 0) {
+      fireChainNext(buildChainUrl('/api/sync-games', {
+        backfill: 1,
+        budget_pages: budgetPages,
+        hop: hop + 1,
+        chain: 1,
+      }));
+      chained = true;
+    }
+
+    return NextResponse.json({
+      ok: true,
+      mode: 'backfill',
+      hop,
+      pagesWalked: seg.pagesWalked,
+      insertedThisSegment: seg.inserted,
+      updatedThisSegment: seg.updated,
+      xxx: { next: state.xxx_next, done: xxxDone },
+      feelex: { done: feelexDone, cursors: state.feelex },
+      totals: { pages_done: state.pages_done, inserted: state.inserted, updated: state.updated },
+      allDone,
+      chained,
+    });
+  }
+
+  // ── ОБЫЧНЫЙ РЕЖИМ ─────────────────────────────────────────────────────
   try {
     const db = getDb();
     let totalNew = 0;
     let totalUpdated = 0;
-    const startedAt = Date.now();
     // Дедлайн СТАРТА новых тяжёлых fetch. После него — только завершение текущей
     // работы и запись sync_status (она обязательна: по ней админ видит живость парсера).
-    // FIX: было 30с — feelex (12 категорий + паузы 800мс) съедал бюджет целиком,
-    // и до xxx-igra очередь не доходила (xxxIgraParsed: 0 каждый запуск).
     // 45с при maxDuration=60 оставляет ~15с на апсерты и запись sync_status.
     const deadline = startedAt + 45_000;
 
     // ─── 0. Бэкфилл обложек xxx-igra (первым делом — чтобы успеть до дедлайна) ──
-    // Старые записи вставлялись с image_url='' (парсер раньше не умел брать
-    // обложки). Конвенция game/{ID}/{ID}.jpg работает для всех игр (проверено
-    // 21/21), поэтому обложка строится из source_url без загрузки страниц.
     const { data: noCoverRows } = await db
       .from('anime_catalog')
       .select('id, source_url, image_url')
@@ -158,21 +486,14 @@ export async function GET(request: Request) {
     console.log(`xxx-igra covers backfilled: ${coversBackfilled}`);
 
     // ─── 0b. xxx-igra.com: страница фетчится ПЕРВЫМ делом (до feelex) ──
-    // FIX: раньше страница xxx-igra грузилась ПОСЛЕ feelex и стабильно не
-    // доживала до дедлайна. Теперь это 1 fetch (~3-5с) в самом начале —
-    // парсинг источника больше не пропускается; апсерты — в секции 2.
     const xxxHtml = await fetchPage(`${XXX_IGRA_BASE}/`);
     const xxxGames = parseXxxIgra(xxxHtml);
     console.log(`xxx-igra.com: ${xxxGames.length} games (prefetched)`);
 
-    // ─── 1. feelex.fun (main source — multiple categories) ──────────
-    const feelexCategories = [
-      'hentai', '2d', '3d', 'rpg', 'simulation', 'visual-novel',
-      'ren-py', 'html5', 'action', 'adventure', 'dating', 'puzzle',
-    ];
+    // ─── 1. feelex.fun (main source — 12 категорий, 1-я страница каждой) ──
     let feelexTotal = 0;
     console.log('Fetching feelex.fun categories...');
-    for (const cat of feelexCategories) {
+    for (const cat of FEELEX_CATEGORIES) {
       if (Date.now() > deadline) { console.log('Games sync: deadline reached, stopping'); break; }
       const html = await fetchPage(`${FEELEX_BASE}/ru/games/${cat}`);
       if (!html || html.length < 5000) continue;
@@ -209,14 +530,12 @@ export async function GET(request: Request) {
           else console.error('feelex insert error:', error.message);
         }
       }
-      if (cat !== feelexCategories[feelexCategories.length - 1]) {
+      if (cat !== FEELEX_CATEGORIES[FEELEX_CATEGORIES.length - 1]) {
         await new Promise(r => setTimeout(r, 800));
       }
     }
 
-    // ─── 2. xxx-igra.com (secondary) ──────────────────────────────
-    // 2a. Апсерты игр, спарсенных на шаге 0b (страница уже загружена, осталась
-    // только запись в БД; описание добирается с страницы игры лишь для НОВЫХ).
+    // ─── 2. xxx-igra.com (secondary): главная страница ──────────────
     if (Date.now() > deadline) {
       console.log('Games sync: deadline reached before xxx-igra, skipping');
     }
@@ -259,12 +578,29 @@ export async function GET(request: Request) {
       details: { feelexParsed: feelexTotal, xxxIgraParsed: xxxGames.length, coversBackfilled, durationMs: Date.now() - startedAt },
     });
     await notifyTelegram(`✅ Синк игр: +${totalNew} новых, обновлено ${totalUpdated}`);
+
+    // ── Автозапуск бэкфилла, если глубокий проход ещё не завершён ─────
+    let backfillChained = false;
+    try {
+      const st = await loadGamesState();
+      const allDone = st.xxx_done && FEELEX_CATEGORIES.every(c => st.feelex_done[c]);
+      if (!allDone) {
+        fireChainNext(buildChainUrl('/api/sync-games', {
+          backfill: 1,
+          hop: 1,
+          chain: 1,
+        }));
+        backfillChained = true;
+      }
+    } catch { /* следующий крон подхватит */ }
+
     return NextResponse.json({
       ok: true,
       feelexGames: feelexTotal,
       xxxIgraGames: xxxGames.length,
       newGames: totalNew,
       updatedGames: totalUpdated,
+      backfillChained,
     });
   } catch (e) {
     console.error('Games sync error:', e);
@@ -272,15 +608,4 @@ export async function GET(request: Request) {
     await notifyTelegram(`❌ Синк игр упал: ${String(e).slice(0, 300)}`);
     return NextResponse.json({ error: 'Sync failed' }, { status: 500 });
   }
-}
-
-// Simple string hash (deterministic, for dedup)
-function hashCode(str: string): number {
-  let hash = 0;
-  for (let i = 0; i < str.length; i++) {
-    const char = str.charCodeAt(i);
-    hash = ((hash << 5) - hash) + char;
-    hash |= 0; // Convert to 32bit integer
-  }
-  return -Math.abs(hash) - 10000; // Negative to avoid collision with vost.pw IDs
 }

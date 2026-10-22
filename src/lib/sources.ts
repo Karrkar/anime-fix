@@ -22,7 +22,11 @@ export const SOURCES = {
   /** Парсер аниме-каталога (sync-anime) */
   vost: {
     base: 'https://v13.vost.pw',
-    hosts: ['v13.vost.pw'],
+    // 2026-10-22: сайт мигрировал на v14 — v13 теперь 301-редиректит на v14.
+    // Оба хоста в белых списках: парсер нормализует ссылки карточек обратно
+    // на v13 (см. normalizeVostDomain), но если что-то пройдёт с v14 —
+    // player-proxy, next/image и CSP его не сломают.
+    hosts: ['v13.vost.pw', 'v14.vost.pw'],
   },
   /** Плеерные страницы/CDN vost.pw — белые списки player-proxy */
   vostCdn: {
@@ -80,6 +84,20 @@ export const XXX_IGRA_BASE = SOURCES.xxxIgra.base;
 export const R34_BASE = SOURCES.rule34.base;
 export const JINA_READER = SOURCES.jinaReader.base;
 export const ANIMEVOST_API_BASE = SOURCES.animevostApi.base;
+
+/**
+ * 2026-10-22: vost.pw переехал на v14.vost.pw (v13 отдаёт 301), и карточки
+ * на глубоких страницах приходят с абсолютными ссылками на v14. Плеер,
+ * CSP frame-src и player-proxy настроены на v13 — без нормализации новые
+ * записи получили бы embed_url на домен, который iframe не может открыть.
+ * Приводим любой хост семейства vost к каноническому v13.
+ */
+export function normalizeVostDomain(url: string): string {
+  if (!url) return url;
+  return url
+    .replace(/^https?:\/\/v14\.vost\.pw\//i, `${VOST_BASE}/`)
+    .replace(/^https?:\/\/vost\.pw\//i, `${VOST_BASE}/`);
+}
 
 /**
  * Белый список хостов для /api/player-proxy.

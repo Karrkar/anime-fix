@@ -4,23 +4,44 @@ import { isCronAuthorized } from '@/lib/cron-auth';
 import { logEvent } from '@/lib/logger';
 import { notifyTelegram } from '@/lib/notify';
 import { recordSyncRun } from '@/lib/sync-status';
-import { VOST_BASE, JINA_READER } from '@/lib/sources'; // F-27: домены из единого реестра
-import { jinaHeaders, markJinaKeyRejected } from '@/lib/jina'; // 2026-10-03: ключ JINA_API_KEY снимает блок датацентровых IP
+import { VOST_BASE, JINA_READER, normalizeVostDomain } from '@/lib/sources'; // F-27: единый реестр источников
+import { jinaHeaders, markJinaKeyRejected } from '@/lib/jina';
+import {
+  buildChainUrl,
+  emptyBackfillState,
+  fireChainNext,
+  loadBackfillState,
+  saveBackfillState,
+  type BackfillState,
+} from '@/lib/sync-chain';
 
 // Лимит времени функции: крон парсит страницы + refresh новых серий.
 // 60с — максимум для Hobby-плана Vercel.
 export const maxDuration = 60;
 
 /**
- * Парсер новых аниме с v13.vost.pw.
- * Крон Vercel вызывает ежедневно без secret (авторизация через заголовок
- * x-vercel-cron / Bearer CRON_SECRET — см. src/lib/cron-auth.ts).
- * Ручной запуск: GET /api/sync-anime?pages=3&secret=<SYNC_SECRET|CRON_SECRET>
- * pages — сколько последних страниц каталога парсить (по умолчанию 3 = ~30 новых аниме)
- * ongoing — сколько страниц категории /ongoing/ парсить (онгоинги = сериалы
- * текущего сезона; сайт публикует их реже, чем обновляет первые страницы,
- * из-за чего полка «Свежее за неделю» пустела)
+ * Парсер каталога vost.pw (v13 → 301 → v14, домен нормализуем на v13).
+ *
+ * ДВА РЕЖИМА (октябрь 2026 — задача «весь контент без ограничений»):
+ *
+ *  1) МЕЛКИЙ (ежедневный, как раньше): страницы 1..pages + ongoing + refresh.
+ *     Стал глубже: pages по умолчанию 4 (было 2), refresh 25 (было 15).
+ *
+ *  2) БЭКФИЛЛ (полный проход архива «по дате», вглубь до первой страницы
+ *     сайта): включается автоматически после мелкого прохода, если курсор
+ *     в sync_status ('vost_backfill') ещё не отмечен done. Ходит страницами
+ *     от самой свежей к самой старой (порядок каталога = порядок дат),
+ *     батч-апсертит ЦЕЛУЮ страницу одним запросом (UNIQUE на vost_id
+ *     подтверждён прод-пробой 42P10/23502) и продолжается самоцепочкой
+ *     (см. lib/sync-chain.ts) — каждый сегмент получает свежие 60 секунд.
+ *
+ *     Ручной запуск бэкфилла: /api/sync-anime?backfill=1[&from_page=N]
+ *     Данные прогресса: sync_status.source='vost_backfill' (details JSON).
  */
+
+const BACKFILL_SOURCE = 'vost_backfill';
+/** Страховочный потолок: каталог vost — 361 страница; дальше не лезем. */
+const VOST_PAGE_HARD_CAP = 400;
 
 interface ParsedAnime {
   vostId: number;
@@ -67,7 +88,9 @@ function parseAnimeCards(html: string): ParsedAnime[] {
       // Ссылка и заголовок из h2 > a (с учётом переносов строк)
       const h2Match = block.match(/<h2>\s*<a href="([^"]+)">([\s\S]*?)<\/a>\s*<\/h2>/);
       if (!h2Match) continue;
-      let sourceUrl = h2Match[1].trim();
+      // 2026-10-22: глубокие страницы приходят с v14.vost.pw (v13 отдаёт 301) —
+      // нормализуем к v13, иначе плеер/CSP/player-proxy не знают новый домен.
+      let sourceUrl = normalizeVostDomain(h2Match[1].trim());
       let rawTitle = h2Match[2].replace(/<[^>]*>/g, '').trim();
 
       // Убираем [1-10 из 12+] и прочие квадратные скобки
@@ -133,10 +156,31 @@ function parseAnimeCards(html: string): ParsedAnime[] {
   return results;
 }
 
+/** Строка для батч-апсерта (UNIQUE на vost_id — прод-проба октябрь 2026). */
+function cardToRow(a: ParsedAnime, updatedAt: string) {
+  return {
+    vost_id: a.vostId,
+    title: a.title || a.titleRussian,
+    title_russian: a.titleRussian,
+    description: a.description,
+    image_url: a.imageUrl,
+    type: a.type,
+    episodes: a.episodes,
+    genres: a.genres,
+    year: a.year,
+    score: a.score,
+    views: a.views,
+    source_url: a.sourceUrl,
+    embed_url: a.embedUrl,
+    is_adult: a.isAdult,
+    updated_at: updatedAt,
+  };
+}
+
 /**
  * Обновление числа серий у УЖЕ добавленных тайтлов (парсер новых серий).
  * Раньше синк добавлял только новые тайтлы с первых страниц, и у старых
- * онгоингов число серий застывало. Теперь дорбираем последние обновлявшиеся
+ * онгоингов число серий застывало. Теперь добираем последние обновлявшиеся
  * тайтлы, ходим на их страницу-источник и подтягиваем актуальное число серий.
  */
 function parseEpisodeCount(html: string): number {
@@ -190,11 +234,119 @@ async function refreshExistingEpisodes(db: ReturnType<typeof getDb>, limit: numb
   return episodesUpdated;
 }
 
+/** Множество существующих vost_id — чтобы отличать insert от update в апсертах. */
+async function loadExistingVostIds(db: ReturnType<typeof getDb>): Promise<Set<number>> {
+  const ids = new Set<number>();
+  const PAGE = 1000;
+  for (let offset = 0; offset < 10_000; offset += PAGE) {
+    const { data, error } = await db
+      .from('anime_catalog')
+      .select('vost_id')
+      .gt('vost_id', 0)
+      .range(offset, offset + PAGE - 1);
+    if (error) throw error;
+    for (const r of (data || []) as { vost_id: number }[]) ids.add(r.vost_id);
+    if (!data || data.length < PAGE) break;
+  }
+  return ids;
+}
+
+/** Один сегмент бэкфилла: пройти страницы [fromPage, fromPage+budget) и
+ *  вернуть, был ли прогресс (для решения о продолжении цепочки). */
+async function runBackfillSegment(
+  db: ReturnType<typeof getDb>,
+  st: BackfillState,
+  budgetPages: number,
+  deadlineMs: number,
+): Promise<{ parsed: number; inserted: number; updated: number; pagesWalked: number }> {
+  let existingIds: Set<number>;
+  try {
+    existingIds = await loadExistingVostIds(db);
+  } catch {
+    existingIds = new Set(); // метрика станет неточной, апсерты всё равно корректны
+  }
+
+  let parsed = 0, inserted = 0, updated = 0, pagesWalked = 0;
+  let fetchFails = 0;
+
+  while (!st.done && pagesWalked < budgetPages && Date.now() < deadlineMs) {
+    const page = st.next_page;
+    if (page > VOST_PAGE_HARD_CAP) {
+      st.done = true;
+      st.note = `page cap ${VOST_PAGE_HARD_CAP}`;
+      break;
+    }
+    const url = `${VOST_BASE}/page/${page}/`;
+    const html = await fetchPage(url, 1, 20000);
+    if (!html || html.length < 5000) {
+      // Сеть/Jina недоступны — это НЕ «конец источника»: страницу не засчитываем,
+      // после двух отказов подряд останавливаем сегмент (источник нездоров).
+      fetchFails++;
+      if (fetchFails >= 2) {
+        console.log(`Backfill vost: fetch failed twice at page ${page}, stopping segment`);
+        break;
+      }
+      continue;
+    }
+    fetchFails = 0;
+    const cards = parseAnimeCards(html);
+    if (cards.length === 0) {
+      st.consecutive_empty++;
+      console.log(`Backfill vost: page ${page} — 0 cards (streak ${st.consecutive_empty})`);
+      if (st.consecutive_empty >= 2) {
+        // За последней страницей каталога источник отдаёт пустую выдачу (200)
+        st.done = true;
+        st.note = 'источник исчерпан (2 подряд пустые страницы)';
+        st.finished_at = new Date().toISOString();
+        break;
+      }
+      // Одна пустая среди заполненных — прокладка/разделитель, идём дальше
+      st.next_page = page + 1;
+      st.pages_done++;
+      pagesWalked++;
+      await saveBackfillState(BACKFILL_SOURCE, st);
+      continue;
+    }
+
+    const updatedAt = new Date().toISOString();
+    const rows = cards.map(a => cardToRow(a, updatedAt));
+    const { error: upErr } = await db
+      .from('anime_catalog')
+      .upsert(rows, { onConflict: 'vost_id' });
+    if (upErr) {
+      console.error(`Backfill vost page ${page} upsert:`, upErr.message);
+      break; // не двигаем курсор: следующая попытка начнёт с этой же страницы
+    }
+
+    // Отличаем insert от update по множеству существующих id
+    let pageInserted = 0, pageUpdated = 0;
+    for (const a of cards) {
+      if (existingIds.has(a.vostId)) pageUpdated++;
+      else { pageInserted++; existingIds.add(a.vostId); }
+    }
+    parsed += cards.length;
+    inserted += pageInserted;
+    updated += pageUpdated;
+    st.inserted += pageInserted;
+    st.updated += pageUpdated;
+    st.next_page = page + 1;
+    st.pages_done++;
+    st.consecutive_empty = 0;
+    pagesWalked++;
+    console.log(`Backfill vost: page ${page} upsert ${cards.length} cards (new ${pageInserted}, upd ${pageUpdated})`);
+
+    // Прогресс — в БД на каждой странице: обрыв теряет максимум одну страницу
+    await saveBackfillState(BACKFILL_SOURCE, st);
+
+    await new Promise(r => setTimeout(r, 2000)); // бережём источник и jina
+  }
+
+  return { parsed, inserted, updated, pagesWalked };
+}
+
 export async function GET(request: Request) {
-  // F-01 fix: раньше требовался ?secret=<SYNC_SECRET>, но переменная была не задана
-  // и оба крона всегда падали 403. Теперь кроны авторизуются через x-vercel-cron.
-  // Аудит 27.09.2026: + админ-сессия — чтобы watchdog/админка могли дёрнуть
-  // синк вручную (как это уже умеет creative-sync).
+  // F-01 fix: кроны авторизуются через Bearer CRON_SECRET; админ-сессия —
+  // для watchdog/ручного запуска (аудит 27.09.2026).
   const user = await authFromRequest(request);
   const isAdmin = !!user && user.role === 'admin';
   if (!isCronAuthorized(request) && !isAdmin) {
@@ -202,13 +354,83 @@ export async function GET(request: Request) {
   }
 
   const { searchParams } = new URL(request.url);
-  const pagesToParse = Math.max(1, Math.min(parseInt(searchParams.get('pages') || '3'), 10));
+  const startedAt = Date.now();
+
+  // ── РЕЖИМ БЭКФИЛЛА ────────────────────────────────────────────────────
+  const backfillRequested =
+    searchParams.has('from_page') || searchParams.get('backfill') === '1';
+  if (backfillRequested) {
+    const state = await loadBackfillState(BACKFILL_SOURCE);
+    const fromPage = Math.max(1, parseInt(searchParams.get('from_page') || '0', 10) || state.next_page);
+    const budgetPages = Math.max(1, Math.min(parseInt(searchParams.get('budget_pages') || '8', 10) || 8, 15));
+    const hop = Math.max(1, Math.min(parseInt(searchParams.get('hop') || '1', 10) || 1, 200));
+    const chainOn = searchParams.get('chain') !== '0';
+    const MAX_HOPS = 45; // 45 сегментов × ~8 стр ≈ весь каталог за сессию
+
+    const st: BackfillState = { ...state, next_page: fromPage };
+    // Явный from_page меньше сохранённого курсора = ручной сброс прогресса
+    // (например, источник вырос и нужно пройти заново) — снимаем done.
+    if (searchParams.has('from_page') && fromPage < state.next_page) {
+      st.done = false;
+      st.consecutive_empty = 0;
+      st.note = 'перезапуск по from_page';
+    }
+    const deadline = startedAt + 44_000; // запас на финальный save + цепочку
+    const db = getDb();
+    const seg = await runBackfillSegment(db, st, budgetPages, deadline);
+
+    const justFinished = st.done && !state.done;
+    await saveBackfillState(BACKFILL_SOURCE, st);
+
+    logEvent('cron_sync_anime_backfill', {
+      from_page: fromPage, next_page: st.next_page, done: st.done, hop,
+      parsed: seg.parsed, inserted: seg.inserted, updated: seg.updated,
+    });
+
+    if (justFinished) {
+      // Итоговое сообщение за весь бэкфилл (не на каждый сегмент — иначе спам)
+      await notifyTelegram(
+        `🏁 Бэкфилл vost завершён: страниц пройдено ${st.pages_done}, ` +
+        `новых тайтлов ${st.inserted}, обновлено ${st.updated}.` +
+        `\nКаталог теперь покрывает весь архив источника.`,
+      );
+    }
+
+    let chained = false;
+    if (!st.done && chainOn && hop < MAX_HOPS && seg.pagesWalked > 0) {
+      fireChainNext(buildChainUrl('/api/sync-anime', {
+        backfill: 1,
+        from_page: st.next_page,
+        budget_pages: budgetPages,
+        hop: hop + 1,
+        chain: 1,
+      }));
+      chained = true;
+    }
+
+    return NextResponse.json({
+      ok: true,
+      mode: 'backfill',
+      hop,
+      from_page: fromPage,
+      next_page: st.next_page,
+      done: st.done,
+      pagesWalked: seg.pagesWalked,
+      parsedThisSegment: seg.parsed,
+      insertedThisSegment: seg.inserted,
+      updatedThisSegment: seg.updated,
+      totals: { pages_done: st.pages_done, inserted: st.inserted, updated: st.updated },
+      chained,
+    });
+  }
+
+  // ── ОБЫЧНЫЙ РЕЖИМ (мелкий ежедневный) ─────────────────────────────────
+  const pagesToParse = Math.max(1, Math.min(parseInt(searchParams.get('pages') || '4'), 10));
   // ongoing=N — страницы категории /ongoing/ (сериалы текущего сезона).
   // Именно там живут вышедшие сериалы, которых нет в первых страницах каталога.
   const ongoingPages = Math.max(0, Math.min(parseInt(searchParams.get('ongoing') || '0') || 0, 5));
   // refresh=N — сколько давно не обновлявшихся тайтлов проверить на новые серии
-  const refreshCount = Math.max(0, Math.min(parseInt(searchParams.get('refresh') || '0') || 0, 50));
-  const startedAt = Date.now();
+  const refreshCount = Math.max(0, Math.min(parseInt(searchParams.get('refresh') || '0') || 0, 60));
 
   try {
     const db = getDb();
@@ -321,6 +543,22 @@ export async function GET(request: Request) {
       `✅ Синк аниме: +${totalNew} новых, обновлено ${totalUpdated}, новых серий: ${episodesUpdated}` +
       `\nСтраниц: ${pagesToParse}, сессий чистил: ${sessionsCleaned}`,
     );
+
+    // ── Автозапуск бэкфилла, если полный проход ещё не завершён ────────
+    let backfillChained = false;
+    try {
+      const st = await loadBackfillState(BACKFILL_SOURCE);
+      if (!st.done) {
+        fireChainNext(buildChainUrl('/api/sync-anime', {
+          backfill: 1,
+          from_page: st.next_page,
+          hop: 1,
+          chain: 1,
+        }));
+        backfillChained = true;
+      }
+    } catch { /* состояние недоступно — попробуем в следующий крон */ }
+
     return NextResponse.json({
       ok: true,
       pagesParsed: pagesToParse,
@@ -329,6 +567,7 @@ export async function GET(request: Request) {
       updatedAnime: totalUpdated,
       episodesUpdated,
       sessionsCleaned,
+      backfillChained,
     });
   } catch (e) {
     console.error('Sync error:', e);
