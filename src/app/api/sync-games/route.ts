@@ -58,6 +58,37 @@ async function fetchPage(url: string, retries = 1, timeoutMs = 12000): Promise<s
   return '';
 }
 
+/** Прямой fetch xxx-igra.com (БЕЗ Jina).
+ *
+ * Сайт НЕ за Cloudflare (голый nginx/PHP, прямой IP) — Jina ему не нужен.
+ * При этом Jina-рендер этого сайта нестабилен: главная через Jina работает,
+ * а index.php?page=N — мгновенные отказы 3 запуска подряд (инцидент
+ * 22.10.2026, games-цепочка умирала за 2-4с). Прямой fetch стабилен:
+ * HTTP 200, ~23КБ, но кодировка windows-1251 — декодируем.
+ *
+ * Возвращает { status, body }: status 200 — страница каталога (парсим
+ * ЛЮБОЙ размер); 404 — ЗА пределами каталога (сайт отдаёт 404-страницу —
+ * это «источник исчерпан», а не ошибка сети); 0 — сеть/HTTP-ошибка
+ * (таймаут, 5xx) — зовите Jina-фолбэк.
+ */
+async function fetchXxxRaw(url: string, timeoutMs = 12000): Promise<{ status: number; body: string }> {
+  try {
+    const r = await fetch(url, {
+      headers: {
+        'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0 Safari/537.36',
+        accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      },
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    if (r.status !== 200 && r.status !== 404) return { status: 0, body: '' };
+    const buf = await r.arrayBuffer();
+    // charset=Windows-1251 (заголовок ответа сайта); Node 24 full-icu умеет
+    return { status: r.status, body: new TextDecoder('windows-1251').decode(buf) };
+  } catch {
+    return { status: 0, body: '' };
+  }
+}
+
 interface GameData {
   title: string;
   description: string;
@@ -107,13 +138,20 @@ function parseFeelex(html: string): GameData[] {
 // ─── xxx-igra.com parser ─────────────────────────────────────────
 function parseXxxIgra(html: string): GameData[] {
   const results: GameData[] = [];
-  const linkPattern = new RegExp('<a[^>]*href="game\\.php\\?i=(\\d+)"[^>]*>([\\s\\S]*?)<\\/a>', 'g');
+  const seen = new Set<string>();
+  // Кавычки-агностик: Jina-рендер отдаёт href="..." (двойные), сырой HTML
+  // сайта — href='...' (одинарные). Заголовок в сыром HTML живёт в
+  // <h2><a class='title_game' href='game.php?i=N'>TITLE</a></h2>; якорь
+  // с картинкой (description_card) остаётся без текста и отсеется ниже.
+  const linkPattern = /<a[^>]*href=(['"])game\.php\?i=(\d+)\1[^>]*>([\s\S]*?)<\/a>/g;
   let m;
 
   while ((m = linkPattern.exec(html)) !== null) {
-    const gameId = m[1];
-    const rawTitle = m[2].replace(/<[^>]*>/g, '').trim();
+    const gameId = m[2];
+    if (seen.has(gameId)) continue;
+    const rawTitle = m[3].replace(/<[^>]*>/g, '').trim();
     if (!rawTitle || rawTitle.length < 3) continue;
+    seen.add(gameId);
 
     const title = rawTitle.replace(/^❤️\s*/, '').trim();
     const sourceUrl = `${XXX_IGRA_BASE}/game.php?i=${gameId}`;
@@ -293,15 +331,33 @@ async function runGamesBackfillSegment(
     // Клампим бюджет fetch под остаток жизни инвока (инцидент 22.10.2026)
     const fb = fetchTimeBudget(deadlineMs);
     if (!fb) break;
-    const html = await fetchPage(url, fb.retries, Math.min(12_000, fb.timeoutMs));
-    // xxx-igra — компактные страницы (сырой HTML ~7КБ, Jina-рендер ещё
-    // меньше): порог 5000 отбраковывал ВАЛИДНЫЕ страницы как «отказ fetch»,
-    // и сегмент умирал мгновенно на первом шаге (инцидент 22.10.2026,
-    // две мгновенные смерти после re-kick). Достаточно отсечь Jina-ошибки
-    // (~200-300 байт JSON) и пустые ответы; «источник исчерпан» определяется
-    // ПАРСИНГОМ (0 игр × 2 подряд), а не размером ответа.
-    const minLen = source === 'xxx' ? 800 : 5000;
-    if (!html || html.length < minLen) {
+    // xxx-igra: ПРЯМОЙ fetch первым (сайт не за Cloudflare — Jina не нужен
+    // и нестабилен для его глубоких страниц), Jina — только фолбэк при
+    // сетевой ошибке прямого. feelex — как раньше, через Jina.
+    let html = '';
+    let minLen = 5000;
+    if (source === 'xxx') {
+      const d = await fetchXxxRaw(url, Math.min(12_000, fb.timeoutMs));
+      if (d.status === 200) {
+        html = d.body;
+        minLen = 0;               // валидный прямой ответ — парсим любым размером
+      } else if (d.status === 404) {
+        minLen = 0;               // за концом каталога: пустая страница, НЕ ошибка
+        // html остаётся '' → парсер даст 0 игр → streak → done
+      } else {
+        html = await fetchPage(url, fb.retries, Math.min(12_000, fb.timeoutMs));
+        minLen = 800;             // Jina-фолбэк: отсекаем его error-JSON (~200-500 байт)
+      }
+    } else {
+      html = await fetchPage(url, fb.retries, Math.min(12_000, fb.timeoutMs));
+    }
+    // minLen вычислен выше по источнику и результату fetch:
+    //   0 — прямой ответ xxx-igra (200 любой размер / 404 «за концом»);
+    //   800 — Jina-фолбэк xxx-igra (отсекаем error-JSON ~200-500 байт);
+    //   5000 — feelex (страницы огромные, меньшее — точно сбой).
+    // «Источник исчерпан» определяется ПАРСИНГОМ (0 игр × 2 подряд),
+    // а не размером ответа. Пустая строка при minLen=0 — валидный случай.
+    if (html.length < minLen) {
       fetchFails++;
       if (fetchFails >= 3) {
         console.log(`Backfill games: fetch failed x${fetchFails} at ${url}, stopping segment`);
@@ -496,7 +552,10 @@ export async function GET(request: Request) {
     console.log(`xxx-igra covers backfilled: ${coversBackfilled}`);
 
     // ─── 0b. xxx-igra.com: страница фетчится ПЕРВЫМ делом (до feelex) ──
-    const xxxHtml = await fetchPage(`${XXX_IGRA_BASE}/`);
+    // Прямой fetch (не-CF сайт, стабильный) с Jina-фолбэком
+    const xxxDirect = await fetchXxxRaw(`${XXX_IGRA_BASE}/`);
+    let xxxHtml = xxxDirect.status === 200 ? xxxDirect.body : '';
+    if (xxxHtml.length < 800) xxxHtml = await fetchPage(`${XXX_IGRA_BASE}/`);
     const xxxGames = parseXxxIgra(xxxHtml);
     console.log(`xxx-igra.com: ${xxxGames.length} games (prefetched)`);
 
