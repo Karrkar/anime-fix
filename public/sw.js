@@ -1,7 +1,7 @@
 /*
  * Service Worker Anime Platforma (PWA).
  *
- * v5 (ap-v5): sw.js теперь отдаётся с Cache-Control: no-cache (next.config.ts) —
+ * v6 (ap-v6): sw.js отдаётся с Cache-Control: no-cache (vercel.json headers, CDN-уровень) —
  * браузер получает свежий SW при каждом заходе, без 4-часового лага CDN.
  * Смена версии при деплое → апдейт → activate вычищает ВСЕ
  * старые кэши (в т.ч. застрявшие чанки старых сборок) → clients.claim()
@@ -14,7 +14,7 @@
  *  - /api/* → СЕТЬ ТОЛЬКО (никогда не кэшируем: чат, гейты, каталог меняются)
  *  - постеры и прочие картинки → cache-first c лимитом записей
  */
-const CACHE_VERSION = 'ap-v5'; // v5: no-cache заголовок для sw.js (next.config.ts) — браузер теперь всегда получает свежий SW
+const CACHE_VERSION = 'ap-v6'; // v6: no-cache заголовки vercel.json (CDN-уровень) — свежий SW при каждом заходе
 const STATIC_CACHE = `${CACHE_VERSION}-static`;
 const IMG_CACHE = `${CACHE_VERSION}-img`;
 const IMG_CACHE_MAX = 120;
