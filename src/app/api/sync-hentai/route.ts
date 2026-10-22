@@ -26,11 +26,19 @@ export const maxDuration = 60;
  *   бэкфил-режим — полный проход архива по датам от свежих к старым
  *   (/?page=N), батч-апсерт страницы одним запросом, самоцепочка
  *   и резюмируемый курсор в sync_status ('hentai_backfill') — см.
- *   lib/sync-chain.ts. Описание/uploadDate в бэкфиле не добираются
- *   (лишний fetch на каждое видео) — их обновит мелкий проход с meta=1.
+ *   lib/sync-chain.ts.
+ *
+ * НОЯБРЬ 2026 (задача «не только игры: арты и хентай тайтлы — весь
+ * контент из источника»): страницы бэкфилла несут только title/cover/
+ * duration/views — описания остались пустыми (0 из 131 записи с
+ * description). МЕТА-РЕЖИМ (?meta_backfill=1) добирает их: проход по
+ * всем /watch/N из БД (диапазон -100000..-1), fetchWatchMeta для
+ * каждого, обновление description/year, резюмируемый курсор по индексу
+ * в sync_status ('hentai_meta'), самоцепочка как у остальных.
  */
 
 const BACKFILL_SOURCE = 'hentai_backfill';
+const META_SOURCE = 'hentai_meta';
 const HB_PAGE_HARD_CAP = 50;
 
 async function fetchPage(url: string, retries = 2, timeoutMs = 30000): Promise<string> {
@@ -110,9 +118,13 @@ function parseListPage(html: string): HentaiVideo[] {
   return results;
 }
 
-async function fetchWatchMeta(hbId: number): Promise<{ description: string; uploadDate: string }> {
+async function fetchWatchMeta(
+  hbId: number,
+  retries = 2,
+  timeoutMs = 30_000,
+): Promise<{ description: string; uploadDate: string }> {
   const url = `${HB_BASE}/watch/${hbId}`;
-  const html = await fetchPage(url);
+  const html = await fetchPage(url, retries, timeoutMs);
   if (!html || html.length < 1000) return { description: '', uploadDate: '' };
 
   const descMatch = html.match(/<meta name="description" content="([^"]+)"/);
@@ -246,6 +258,82 @@ async function runBackfillSegment(
   return { parsed, inserted, updated, pagesWalked };
 }
 
+/** Один сегмент мета-прохода: добор description/uploadDate для записей,
+ * уже лежащих в БД (диапазон хентая: vost_id -100000..-1). Каждое видео —
+ * отдельный fetch /watch/N (Jina, ~2-5с) + пауза 300мс. Прогресс — курсор
+ * next_page, использующийся как ИНДЕКС в списке hbIds (переиспользуем
+ * BackfillState ради общей инфраструктуры сохранения в sync-chain).
+ */
+async function runMetaSegment(
+  db: ReturnType<typeof getDb>,
+  st: BackfillState,
+  budgetVideos: number,
+  deadlineMs: number,
+): Promise<{ processed: number; filled: number; skipped: number }> {
+  // Список hbId берём из БД каждый сегмент (131 строка — дёшево), порядок
+  // стабильный (order by vost_id asc) — индекс курсора воспроизводим.
+  const { data: rows } = await db
+    .from('anime_catalog')
+    .select('vost_id')
+    .lt('vost_id', 0)
+    .gt('vost_id', -100000)
+    .order('vost_id', { ascending: true })
+    .limit(10_000);
+  const hbIds = ((rows || []) as { vost_id: number }[]).map(r => -r.vost_id);
+  if (hbIds.length === 0) {
+    st.done = true;
+    st.note = 'в БД нет хентай-записей — мета-проход не нужен';
+    return { processed: 0, filled: 0, skipped: 0 };
+  }
+
+  let processed = 0, filled = 0, skipped = 0;
+  while (st.next_page < hbIds.length && processed < budgetVideos && Date.now() < deadlineMs) {
+    const idx = st.next_page;
+    const hbId = hbIds[idx];
+    const fb = fetchTimeBudget(deadlineMs);
+    if (!fb) break;
+    let meta: { description: string; uploadDate: string } | null = null;
+    try {
+      meta = await fetchWatchMeta(hbId, 1, fb.timeoutMs > 20_000 ? 20_000 : fb.timeoutMs);
+    } catch {
+      meta = null;
+    }
+    if (!meta || (!meta.description && !meta.uploadDate)) {
+      // Страница не далась ИЛИ без меты (Jina-блок/мусор) — не крутим на
+      // месте: пропускаем и идём дальше (иначе один битый id вешает цепочку).
+      skipped++;
+      st.next_page = idx + 1;
+      st.pages_done++;
+      processed++;
+      await saveBackfillState(META_SOURCE, st);
+      continue;
+    }
+    const year = meta.uploadDate ? new Date(meta.uploadDate).getFullYear() : null;
+    const { error: upErr } = await db
+      .from('anime_catalog')
+      .update({
+        description: meta.description,
+        ...(year && Number.isFinite(year) && year > 1990 && year < 2100 ? { year } : {}),
+        updated_at: new Date().toISOString(),
+      })
+      .eq('vost_id', -hbId);
+    if (upErr) console.error(`Meta hentai #${hbId} update:`, upErr.message);
+    else { filled++; st.updated++; }
+
+    st.next_page = idx + 1;
+    st.pages_done++;
+    processed++;
+    await saveBackfillState(META_SOURCE, st);
+    await new Promise(r => setTimeout(r, 300)); // бережём источник
+  }
+  if (st.next_page >= hbIds.length) {
+    st.done = true;
+    st.note = 'мета добрана для всех записей';
+    st.finished_at = new Date().toISOString();
+  }
+  return { processed, filled, skipped };
+}
+
 export async function GET(request: Request) {
   // F-01 fix + аудит 27.09.2026: крон/secret/админ-сессия.
   const user = await authFromRequest(request);
@@ -256,6 +344,71 @@ export async function GET(request: Request) {
 
   const { searchParams } = new URL(request.url);
   const startedAt = Date.now();
+
+  // ── РЕЖИМ МЕТА-БЭКФИЛЛА (?meta_backfill=1) ───────────────────────────
+  // Добирает description/uploadDate для записей, вставленных страничным
+  // бэкфиллом без меты (см. шапку файла). Приоритетнее ?backfill=1 —
+  // watchdog шлёт оба флага сразу, мета должна выиграть разбор.
+  if (searchParams.get('meta_backfill') === '1') {
+    const state = await loadBackfillState(META_SOURCE);
+    // Курсор next_page у мета-режима — ИНДЕКС в списке hbIds (с 0). У
+    // loadBackfillState дефолт 2 («страницы»): свежая запись без обработанных
+    // видео (pages_done=0) распознаётся по паре (2, 0) и стартует с индекса 0.
+    if (!state.done && state.pages_done === 0) state.next_page = 0;
+    const fromIndex = Math.max(0, parseInt(searchParams.get('from_index') || '0', 10) || 0);
+    const budgetVideos = Math.max(1, Math.min(parseInt(searchParams.get('budget') || '6', 10) || 6, 12));
+    const hop = Math.max(1, Math.min(parseInt(searchParams.get('hop') || '1', 10) || 1, 100));
+    const chainOn = searchParams.get('chain') !== '0';
+    const MAX_META_HOPS = 60; // 131 видео / ~6 на звено ≈ 22 звена; запас
+
+    const st: BackfillState = { ...state };
+    if (searchParams.has('from_index') && fromIndex !== state.next_page) {
+      // ручной сброс/продолжение с явным индексом
+      st.next_page = fromIndex;
+      if (fromIndex < state.next_page) st.done = false;
+    }
+    const deadline = startedAt + 44_000;
+    const db = getDb();
+    const seg = await runMetaSegment(db, st, budgetVideos, deadline);
+
+    const justFinished = st.done && !state.done;
+    await saveBackfillState(META_SOURCE, st);
+    logEvent('cron_sync_hentai_meta', {
+      next_index: st.next_page, done: st.done, hop,
+      processed: seg.processed, filled: seg.filled, skipped: seg.skipped,
+    });
+
+    if (justFinished) {
+      await notifyTelegram(
+        `📝 Мета-проход хентай завершён: описаний добрано ${st.updated}, пропущено ${seg.skipped}.`,
+      );
+    }
+
+    let chained = false;
+    if (!st.done && chainOn && hop < MAX_META_HOPS && seg.processed > 0) {
+      fireChainNext(buildChainUrl('/api/sync-hentai', {
+        meta_backfill: 1,
+        from_index: st.next_page,
+        budget: budgetVideos,
+        hop: hop + 1,
+        chain: 1,
+      }));
+      chained = true;
+    }
+
+    return NextResponse.json({
+      ok: true,
+      mode: 'meta_backfill',
+      hop,
+      next_index: st.next_page,
+      done: st.done,
+      processedThisSegment: seg.processed,
+      filledThisSegment: seg.filled,
+      skippedThisSegment: seg.skipped,
+      totals: { processed: st.pages_done, filled: st.updated },
+      chained,
+    });
+  }
 
   // ── РЕЖИМ БЭКФИЛЛА ────────────────────────────────────────────────────
   const backfillRequested =

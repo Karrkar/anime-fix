@@ -43,6 +43,7 @@ interface BackfillDef {
   source: string;               // строка *_backfill в sync_status
   path: string;                 // эндпоинт цепочки
   useFromPage?: boolean;         // vost/hentai: продолжение с конкретной страницы
+  extraParams?: Record<string, string | number | boolean>; // доп. параметры запуска (например meta_backfill)
   isDone: (d: Record<string, unknown>) => boolean;
 }
 
@@ -54,6 +55,14 @@ const BACKFILL_DEFS: BackfillDef[] = [
   },
   {
     source: 'hentai_backfill', path: '/api/sync-hentai', useFromPage: true,
+    isDone: d => d.done === true,
+  },
+  {
+    // НОЯБРЬ 2026: мета-проход хентая — добор описаний/дат для записей,
+    // вставленных страничным бэкфиллом (у 131 записи description пуст).
+    // Курсор hentai_meta.next_page — ИНДЕКС видео, поэтому from_page не
+    // используем: маршрут сам продолжает с сохранённого next_page.
+    source: 'hentai_meta', path: '/api/sync-hentai', extraParams: { meta_backfill: 1 },
     isDone: d => d.done === true,
   },
   {
@@ -201,6 +210,7 @@ async function watchdogHandler(request: NextRequest) {
         fireChainNext(buildChainUrl(bf.path, {
           backfill: 1,
           ...(bf.useFromPage && Number(d.next_page) >= 1 ? { from_page: Math.floor(Number(d.next_page)) } : {}),
+          ...(bf.extraParams || {}),
           hop: 1,
           chain: 1,
         }));

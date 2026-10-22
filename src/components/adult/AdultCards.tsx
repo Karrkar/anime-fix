@@ -76,6 +76,24 @@ export function HentaiCard({ anime, onOpen, onFav, isFav }: {
 }
 
 /* ──────────────────── Art Viewer Image ──────────────────── */
+/** НОЯБРЬ 2026 (задача «арты: парсить всё из источника»): вывод полноразмерного
+ * URL из URL миниатюры rule34. Хеш файла в миниатюре ТОТ ЖЕ, что в полном
+ * изображении, меняется только путь и префикс:
+ *   https://wimg.rule34.xxx/thumbnails/813/thumbnail_<hash>.jpg?<postId>
+ *   → https://wimg.rule34.xxx/images/813/<hash>.<ext>
+ * Расширение миниатюры всегда .jpg, а у полного файла может быть jpeg/png/gif
+ * (webm/mp4 отсекаем — <img> их не отрисовывает, видео-посты детектятся
+ * по /videos/ в миниатюре ещё в списке).
+ * Нужно, потому что /api/rule34-post (Jina-рендер страницы поста) стабильно
+ * мёртв при пустом балансе JINA_API_KEY — а хеш известен и без деталки. */
+function deriveFullCandidates(thumbnailUrl: string): string[] {
+  if (!thumbnailUrl) return [];
+  const m = thumbnailUrl.match(/^(https?:\/\/[^\/]+)\/thumbnails\/(\d+)\/thumbnail_([a-f0-9]{16,64})\./i);
+  if (!m) return [];
+  const [, origin, dir, hash] = m;
+  return [`${origin}/images/${dir}/${hash}.jpeg`, `${origin}/images/${dir}/${hash}.png`, `${origin}/images/${dir}/${hash}.gif`];
+}
+
 export function ArtViewerImage({ fullImgUrl, thumbnailUrl, title }: { fullImgUrl: string; thumbnailUrl: string; title: string }) {
   // 2026-10-08, фикс «чёрный экран арта на мобильных» (финальная версия):
   //
@@ -119,12 +137,26 @@ export function ArtViewerImage({ fullImgUrl, thumbnailUrl, title }: { fullImgUrl
           .catch(() => { /* превью не критично */ });
       }
 
-      // 2) Основная цепочка: полная через прокси → миниатюра через прокси →
-      //    прямой CDN с коротким таймаутом
+      // 2) Основная цепочка: полная через прокси → КАНДИДАТЫ из миниатюры →
+      //    миниатюра через прокси → прямой CDN с коротким таймаутом
       const chain: Array<[string, number]> = [];
       if (fullImgUrl) chain.push([proxied(fullImgUrl), 15_000]);
+      const candidates = deriveFullCandidates(thumbnailUrl);
+      if (!fullImgUrl && candidates.length > 0) {
+        // Деталка /api/rule34-post не дала точный URL (Jina-баланс/блок) —
+        // гоняем кандидатов ПАРАЛЛЕЛЬНО (Promise.any): .jpeg покрывает ~70%
+        // постов, .png/.gif — почти всё остальное. Первый 200 побеждает.
+        try {
+          const blobUrl = await Promise.any(candidates.map(c =>
+            hedgeLoadImage(proxied(c), { waves: 1, perWave: 3, timeoutMs: 15_000 })));
+          if (!alive) { URL.revokeObjectURL(blobUrl); return; }
+          setMainSrc(keep(blobUrl));
+          setLoading(false);
+          return;
+        } catch { /* все кандидаты отказали — дальше по цепочке */ }
+      }
       if (thumbnailUrl) chain.push([proxied(thumbnailUrl), 12_000]);
-      const directUrl = fullImgUrl || thumbnailUrl;
+      const directUrl = fullImgUrl || candidates[0] || thumbnailUrl;
       if (directUrl) chain.push([directUrl, 6_000]); // для VPN/зарубежных; в РФ быстро откажется
 
       for (const [u, ms] of chain) {

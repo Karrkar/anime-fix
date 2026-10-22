@@ -32,9 +32,42 @@ export const maxDuration = 60;
  */
 
 const BACKFILL_SOURCE = 'games_backfill';
+// НОЯБРЬ 2026 (задача «парси всё, что указано в источнике»): список
+// выписан со живого feelex.fun/ru/games — 97 контентных категорий
+// (тематические + категории конкретных игр; сортировки/фильтры вида
+// best/new/popular/os/engine/device НЕ включены — это не контент).
+// Прежний список из 12 категорий устарел наполовину: 6 из них
+// (simulation, ren-py, html5, action, dating, puzzle) на сайте больше
+// не существуют — сайт мигрировал структуру в 2026-10.
+// Источник постоянно добавляет новые категории-игры: список периодически
+// обновлять по /ru/games (скрипт scripts/feelex_categories.py в поставке).
 const FEELEX_CATEGORIES = [
-  'hentai', '2d', '3d', 'rpg', 'simulation', 'visual-novel',
-  'ren-py', 'html5', 'action', 'adventure', 'dating', 'puzzle',
+  '2d', '3d', 'adventure', 'hentai', 'rpg', 'sci-fi', 'visual-novel',
+  'ahegao', 'ai', 'anal', 'animated', 'asian', 'avatar', 'bbw', 'bdsm',
+  'big-ass', 'big-tits', 'blowjob', 'cartoon', 'cheating', 'creampie',
+  'femdom', 'footjob', 'furry', 'futanari', 'goth', 'handjob', 'hd',
+  'incest', 'milf', 'monster', 'naruto', 'overwatch', 'parody', 'pov',
+  'realistic', 'resident-evil', 'spanking', 'teen',
+  'american-dad', 'american-dad-good-morning', 'american-dad-group-fuck',
+  'american-dad-happy-new-year', 'borderlands', 'croft-adventures',
+  'lady-dimitrescu', 'lady-dimitrescu-rising-legends',
+  '14-days-of-desire', '16-years-later', '2nd-chance-season-2',
+  'a-big-family-in-debt', 'a-detectives-way', 'a-fathers-sins',
+  'a-favor-for-a-friend', 'addicted-milf', 'after-the-infection-episode2',
+  'bad-memories', 'bastians-family-secret', 'black-dominant',
+  'bordereroticlands', 'cyberdesirex', 'cyberkinkpassion',
+  'cyberlustdistrict', 'cyberpunk', 'cyberseduction', 'digitaltemptation',
+  'game-of-hearts-chapter-3', 'getting-intimate-ch1', 'group-work',
+  'growing-things-up', 'halloweens-whispered-fate-ep1',
+  'her-desire-season-3', 'milf-lover', 'milfheim-the-twisted',
+  'my-employee-family-6', 'my-employees-family',
+  'natasha-naughty-wife-part-2', 'neonkinkcity', 'neonlustprotocol',
+  'neonpleasurezone', 'project-dreadsteel', 'resident-evil-sex-waves',
+  'rightful-ownership', 'romcom-divergence', 'school-days-2',
+  'shst-bad-day', 'syntheticpassion', 'taboo-university-book-two',
+  'the-seven-realms-r3', 'twists-of-my-life', 'u4ia', 'uni',
+  'unnatural-instinct', 'vdg-anna', 'virtualdesire', 'weekend-fuck',
+  'widow-sex-maker',
 ] as const;
 const XXX_PAGE_HARD_CAP = 120;
 const FEELEX_PAGE_HARD_CAP = 30;
@@ -314,11 +347,15 @@ async function runGamesBackfillSegment(
       url = `${XXX_IGRA_BASE}/index.php?page=${st.xxx_next}`;
       source = 'xxx';
     } else {
-      // ── Фаза 2: feelex по категориям (страницы 2..7 каждой) ──────────
+      // ── Фаза 2: feelex по категориям ────────────────────────────────
+      // НОЯБРЬ 2026: стартуем с 1-й страницы (не с 2-й): при 97 категориях
+      // дневной мелкий режим успевает пройти только их часть до дедлайна,
+      // и страницы 1 «недостающих» категорий иначе не попадут в БД вообще.
+      // Дубли по vost_id погашаются upsert'ом — повтор harmless.
       const pendingCat = FEELEX_CATEGORIES.find(c => !st.feelex_done[c]);
       if (!pendingCat) break; // всё пройдено
       cat = pendingCat;
-      const nextPage = Math.max(2, Number(st.feelex[cat]) || 2);
+      const nextPage = Math.max(1, Number(st.feelex[cat]) || 1);
       if (nextPage > FEELEX_PAGE_HARD_CAP) {
         st.feelex_done[cat] = true;
         continue;
