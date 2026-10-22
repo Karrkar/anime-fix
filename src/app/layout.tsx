@@ -18,17 +18,17 @@ const SITE_URL = process.env.NEXT_PUBLIC_SITE_URL || "https://anime-fix.vercel.a
 export const metadata: Metadata = {
   metadataBase: new URL(SITE_URL),
   title: {
-    default: "AnimePlatform — смотреть аниме онлайн бесплатно",
-    template: "%s — AnimePlatform",
+    default: "Anime Platforma — смотреть аниме онлайн бесплатно",
+    template: "%s — Anime Platforma",
   },
   description:
     "Тысячи аниме тайтлов, свежие серии и лучшие арты — всё в одном месте. Смотри аниме онлайн бесплатно в хорошем качестве.",
   keywords: ["аниме", "смотреть аниме", "аниме онлайн", "аниме бесплатно", "аниме с русской озвучкой", "anime online"],
-  applicationName: "AnimePlatform",
+  applicationName: "Anime Platforma",
   manifest: "/manifest.webmanifest",
   appleWebApp: {
     capable: true,
-    title: "AnimePlatform",
+    title: "Anime Platforma",
     statusBarStyle: "black-translucent",
   },
   icons: {
@@ -45,16 +45,16 @@ export const metadata: Metadata = {
   },
   openGraph: {
     type: "website",
-    siteName: "AnimePlatform",
+    siteName: "Anime Platforma",
     locale: "ru_RU",
     url: SITE_URL,
-    title: "AnimePlatform — смотреть аниме онлайн бесплатно",
+    title: "Anime Platforma — смотреть аниме онлайн бесплатно",
     description: "Тысячи аниме тайтлов, свежие серии и лучшие арты — всё в одном месте.",
-    images: [{ url: "/icons/icon-512.png?v=ap3", width: 512, height: 512, alt: "AnimePlatform" }],
+    images: [{ url: "/icons/icon-512.png?v=ap3", width: 512, height: 512, alt: "Anime Platforma" }],
   },
   twitter: {
     card: "summary_large_image",
-    title: "AnimePlatform — смотреть аниме онлайн бесплатно",
+    title: "Anime Platforma — смотреть аниме онлайн бесплатно",
     description: "Тысячи аниме тайтлов, свежие серии и лучшие арты — всё в одном месте.",
     images: ["/icons/icon-512.png?v=ap3"],
   },

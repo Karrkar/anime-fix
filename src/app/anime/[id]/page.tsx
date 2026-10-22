@@ -226,7 +226,7 @@ export default async function AnimePage({ params }: { params: Promise<{ id: stri
         </div>
 
         <div className="mt-10 pt-6 border-t border-[var(--border)] text-center text-xs text-[var(--muted-foreground)]">
-          <p>AnimePlatform — смотреть аниме онлайн бесплатно. © 2026</p>
+          <p>Anime Platforma — смотреть аниме онлайн бесплатно. © 2026</p>
         </div>
       </div>
     </div>

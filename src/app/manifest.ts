@@ -7,7 +7,7 @@ import type { MetadataRoute } from 'next';
  */
 export default function manifest(): MetadataRoute.Manifest {
   return {
-    name: 'AnimePlatform — смотреть аниме онлайн',
+    name: 'Anime Platforma — смотреть аниме онлайн',
     short_name: 'Anime',
     description:
       'Тысячи тайтлов, свежие серии и лучшие арты — всё в одном месте. Смотри аниме онлайн бесплатно.',

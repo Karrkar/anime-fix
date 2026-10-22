@@ -89,8 +89,8 @@ export function Navbar({ page, onNavigate, onSearch, favCount, favUpd, onMoreOpe
   return (
     <header className="sticky top-0 z-50 bg-[var(--background)]/95 backdrop-blur-md border-b border-[var(--border)]">
       <div className="max-w-7xl mx-auto px-4 h-12 sm:h-14 flex items-center justify-between">
-        <button onClick={() => onNavigate('home')} className="flex items-center gap-1.5 sm:gap-2 font-bold text-base sm:text-lg text-[var(--primary)] hover:opacity-80 transition-opacity" aria-label="AnimePlatform — на главную">
-          <ApLogo className="w-6 h-6 sm:w-7 sm:h-7 shrink-0 drop-shadow-[0_1px_3px_rgba(250,204,21,0.35)]" /> <span className="hidden xs:inline">Anime</span>Platform
+        <button onClick={() => onNavigate('home')} className="flex items-center gap-1.5 sm:gap-2 font-bold text-[15px] sm:text-lg text-[var(--primary)] hover:opacity-80 transition-opacity" aria-label="Anime Platforma — на главную">
+          <ApLogo className="w-6 h-6 sm:w-7 sm:h-7 shrink-0 drop-shadow-[0_1px_3px_rgba(250,204,21,0.35)]" /> <span>Anime Platforma</span>
         </button>
         <nav className="hidden md:flex items-center gap-1">
           {links.map(l => {

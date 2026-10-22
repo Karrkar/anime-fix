@@ -27,6 +27,17 @@ const nextConfig: NextConfig = {
   async headers() {
     return [
       {
+        // КРИТИЧНО: sw.js не должен кэшироваться CDN/браузером надолго.
+        // Раньше Vercel отдавал public/sw.js с max-age=14400 (4 часа) —
+        // после деплоя браузеры продолжали получать СТАРЫЙ service worker,
+        // и «лечение» застрявших вкладок опаздывало на часы. По спецификации
+        // SW должен проверяться при каждой навигации.
+        source: "/sw.js",
+        headers: [
+          { key: 'Cache-Control', value: 'public, max-age=0, must-revalidate' },
+        ],
+      },
+      {
         source: "/(.*)",
         headers: [
           { key: 'X-Frame-Options', value: 'SAMEORIGIN' },

@@ -1,8 +1,9 @@
 /*
- * Service Worker AnimePlatform (PWA).
+ * Service Worker Anime Platforma (PWA).
  *
- * v4 (ap-v4): то же поведение, что v3, но смена версии при деплее —
- * браузер видит новые байты sw.js → ставит апдейт → activate вычищает ВСЕ
+ * v5 (ap-v5): sw.js теперь отдаётся с Cache-Control: no-cache (next.config.ts) —
+ * браузер получает свежий SW при каждом заходе, без 4-часового лага CDN.
+ * Смена версии при деплое → апдейт → activate вычищает ВСЕ
  * старые кэши (в т.ч. застрявшие чанки старых сборок) → clients.claim()
  * переводит открытые вкладки под новый SW. Это лечит «замурованную» вкладку
  * со старым HTML/чанками после серии деплоев.
@@ -13,7 +14,7 @@
  *  - /api/* → СЕТЬ ТОЛЬКО (никогда не кэшируем: чат, гейты, каталог меняются)
  *  - постеры и прочие картинки → cache-first c лимитом записей
  */
-const CACHE_VERSION = 'ap-v4';
+const CACHE_VERSION = 'ap-v5'; // v5: no-cache заголовок для sw.js (next.config.ts) — браузер теперь всегда получает свежий SW
 const STATIC_CACHE = `${CACHE_VERSION}-static`;
 const IMG_CACHE = `${CACHE_VERSION}-img`;
 const IMG_CACHE_MAX = 120;

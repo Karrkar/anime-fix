@@ -181,7 +181,7 @@ export function fireChainNext(url: string): void {
     // loadBackfillState в начале выполнения.
     const headers: Record<string, string> = {
       accept: 'application/json',
-      'user-agent': 'Mozilla/5.0 (compatible; AnimePlatformSyncChain/1.0)',
+      'user-agent': 'Mozilla/5.0 (compatible; AnimePlatformaSyncChain/1.0)',
     };
     if (secret) headers.authorization = `Bearer ${secret}`;
     for (let attempt = 0; attempt < 3; attempt++) {
