@@ -159,9 +159,7 @@ export function fetchTimeBudget(
  */
 export function fireChainNext(url: string): void {
   if (!url) return;
-  const headers: Record<string, string> = { accept: 'application/json' };
   const secret = process.env.CRON_SECRET?.trim();
-  if (secret) headers.authorization = `Bearer ${secret}`;
 
   // ВАЖНО: колбэк after() ВОЗВРАЩАЕТ промис запроса, а не «void»-ит его.
   // Отсоединённый промис (after(() => void fetch(...))) рантайм считает
@@ -175,11 +173,28 @@ export function fireChainNext(url: string): void {
   // наш инвок убьют по maxDuration ДО получения заголовков ответа —
   // запрос давно маршрутизирован, отмена на нашей стороне его не касается.
   const fire = async (): Promise<void> => {
-    try {
-      const r = await fetch(url, { headers, redirect: 'follow' });
-      // Заголовки пришли — звено живёт; закрываем тело за собой, не читая
-      try { r.body?.cancel(); } catch { /* уже закрыт */ }
-    } catch { /* цепочка оборвалась — курсор в sync_status подхватит следующий крон */ }
+    // UA обязателен: запросы без User-Agent Cloudflare периодически
+    // челленджит (403/503) — звено молча не запускалось (инцидент
+    // 22.10.2026: цепочки умирали каждые ~4 звена). + один повтор при
+    // не-ok ответе: повтор безопасен — если первый запрос не дошёл до
+    // роута, звено не выполнялось; коллизию курсоров исключает его же
+    // loadBackfillState в начале выполнения.
+    const headers: Record<string, string> = {
+      accept: 'application/json',
+      'user-agent': 'Mozilla/5.0 (compatible; AnimePlatformSyncChain/1.0)',
+    };
+    if (secret) headers.authorization = `Bearer ${secret}`;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const r = await fetch(url, { headers, redirect: 'follow' });
+        // Заголовки пришли — закрываем тело за собой, не читая
+        try { r.body?.cancel(); } catch { /* уже закрыт */ }
+        if (r.ok) return; // звено принято роутом
+        // 403/5xx (CF-челлендж, платформенный сбой) — повтор через секунду
+      } catch { /* сеть — повтор */ }
+      await new Promise(res => setTimeout(res, 1_000));
+    }
+    // обе попытки не прошли — курсор в sync_status подхватит следующий крон
   };
 
   try {
