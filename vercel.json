@@ -26,7 +26,27 @@
     },
     {
       "path": "/api/watchdog",
-      "schedule": "35 10 * * *"
+      "schedule": "30 8 * * *"
+    },
+    {
+      "path": "/api/watchdog",
+      "schedule": "30 10 * * *"
+    },
+    {
+      "path": "/api/watchdog",
+      "schedule": "30 12 * * *"
+    },
+    {
+      "path": "/api/watchdog",
+      "schedule": "30 14 * * *"
+    },
+    {
+      "path": "/api/watchdog",
+      "schedule": "30 16 * * *"
+    },
+    {
+      "path": "/api/watchdog",
+      "schedule": "30 18 * * *"
     }
   ]
 }
