@@ -33,41 +33,23 @@ export const maxDuration = 60;
 
 const BACKFILL_SOURCE = 'games_backfill';
 // НОЯБРЬ 2026 (задача «парси всё, что указано в источнике»): список
-// выписан со живого feelex.fun/ru/games — 97 контентных категорий
-// (тематические + категории конкретных игр; сортировки/фильтры вида
-// best/new/popular/os/engine/device НЕ включены — это не контент).
+// выписан со живого feelex.fun/ru/games — 43 контентные категории
+// (href="…/games/<slug>" БЕЗ /play — только настоящие категории;
+// сортировки/фильтры best/new/popular/os/engine/device НЕ включены).
+// Каждая проверена валидацией: /ru/games/<cat> → 200 + card-game-block
+// (скрипт scripts/feelex_categories_v2.py в поставке).
 // Прежний список из 12 категорий устарел наполовину: 6 из них
 // (simulation, ren-py, html5, action, dating, puzzle) на сайте больше
 // не существуют — сайт мигрировал структуру в 2026-10.
-// Источник постоянно добавляет новые категории-игры: список периодически
-// обновлять по /ru/games (скрипт scripts/feelex_categories.py в поставке).
 const FEELEX_CATEGORIES = [
-  '2d', '3d', 'adventure', 'hentai', 'rpg', 'sci-fi', 'visual-novel',
-  'ahegao', 'ai', 'anal', 'animated', 'asian', 'avatar', 'bbw', 'bdsm',
-  'big-ass', 'big-tits', 'blowjob', 'cartoon', 'cheating', 'creampie',
-  'femdom', 'footjob', 'furry', 'futanari', 'goth', 'handjob', 'hd',
-  'incest', 'milf', 'monster', 'naruto', 'overwatch', 'parody', 'pov',
-  'realistic', 'resident-evil', 'spanking', 'teen',
-  'american-dad', 'american-dad-good-morning', 'american-dad-group-fuck',
-  'american-dad-happy-new-year', 'borderlands', 'croft-adventures',
-  'lady-dimitrescu', 'lady-dimitrescu-rising-legends',
-  '14-days-of-desire', '16-years-later', '2nd-chance-season-2',
-  'a-big-family-in-debt', 'a-detectives-way', 'a-fathers-sins',
-  'a-favor-for-a-friend', 'addicted-milf', 'after-the-infection-episode2',
-  'bad-memories', 'bastians-family-secret', 'black-dominant',
-  'bordereroticlands', 'cyberdesirex', 'cyberkinkpassion',
-  'cyberlustdistrict', 'cyberpunk', 'cyberseduction', 'digitaltemptation',
-  'game-of-hearts-chapter-3', 'getting-intimate-ch1', 'group-work',
-  'growing-things-up', 'halloweens-whispered-fate-ep1',
-  'her-desire-season-3', 'milf-lover', 'milfheim-the-twisted',
-  'my-employee-family-6', 'my-employees-family',
-  'natasha-naughty-wife-part-2', 'neonkinkcity', 'neonlustprotocol',
-  'neonpleasurezone', 'project-dreadsteel', 'resident-evil-sex-waves',
-  'rightful-ownership', 'romcom-divergence', 'school-days-2',
-  'shst-bad-day', 'syntheticpassion', 'taboo-university-book-two',
-  'the-seven-realms-r3', 'twists-of-my-life', 'u4ia', 'uni',
-  'unnatural-instinct', 'vdg-anna', 'virtualdesire', 'weekend-fuck',
-  'widow-sex-maker',
+  '2d', '3d', 'adventure', 'ahegao', 'ai', 'american-dad',
+  'anal', 'animated', 'asian', 'avatar', 'bbw', 'bdsm',
+  'big-ass', 'big-tits', 'blowjob', 'borderlands', 'cartoon', 'cheating',
+  'creampie', 'cyberpunk', 'femdom', 'footjob', 'furry', 'futanari',
+  'goth', 'handjob', 'hd', 'hentai', 'incest', 'lady-dimitrescu',
+  'milf', 'monster', 'naruto', 'overwatch', 'parody', 'pov',
+  'realistic', 'resident-evil', 'rpg', 'sci-fi', 'spanking', 'teen',
+  'visual-novel',
 ] as const;
 const XXX_PAGE_HARD_CAP = 120;
 const FEELEX_PAGE_HARD_CAP = 30;
@@ -156,7 +138,12 @@ function parseFeelex(html: string): GameData[] {
       if (urlStart > -1) {
         const hrefEnd = block.indexOf('/play"', urlStart);
         if (hrefEnd > -1) {
-          sourceUrl = block.slice(urlStart + 6, hrefEnd + 6);
+          // НОЯБРЬ 2026, фикс «игры feelex открываются на 404»: прежний
+          // slice(urlStart+6, hrefEnd+6) захватывал ЗАКРЫВАЮЩУЮ кавычку href
+          // («…/play"»), и все 1213 записей в БД имели хвостовую кавычку в
+          // source_url/embed_url — браузер кодировал её в %22 → 404.
+          // Правильная граница: hrefEnd+5 — сразу после «play».
+          sourceUrl = block.slice(urlStart + 6, hrefEnd + 5);
         }
       }
 
