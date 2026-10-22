@@ -35,6 +35,7 @@
  * vost.pw/page/362 и hentaibaza/?page=11) + страховочный потолок страниц.
  */
 
+import { after } from 'next/server';
 import { getDb } from './db';
 
 /** Публичный origin для самоцепочки.
@@ -134,10 +135,27 @@ export function fireChainNext(url: string): void {
   const headers: Record<string, string> = { accept: 'application/json' };
   const secret = process.env.CRON_SECRET?.trim();
   if (secret) headers.authorization = `Bearer ${secret}`;
-  void fetch(url, { headers, redirect: 'follow' })
-    .then(r => {
-      // Заголовки пришли — звено ОТРАБОТАЛО и вернуло ответ; закрываем за собой
-      try { r.body?.cancel(); } catch { /* уже закрыт */ }
-    })
-    .catch(() => { /* цепочка оборвалась — курсор в sync_status подхватит следующий крон */ });
+
+  const fire = () => {
+    void fetch(url, { headers, redirect: 'follow' })
+      .then(r => {
+        // Заголовки пришли — звено живёт; закрываем тело за собой, не читая
+        try { r.body?.cancel(); } catch { /* уже закрыт */ }
+      })
+      .catch(() => { /* цепочка оборвалась — курсор в sync_status подхватит следующий крон */ });
+  };
+
+  // ПОЧЕМУ after(), А НЕ ПРЯМОЙ fetch: прямой void fetch() гонится с
+  // заморозкой контейнера сразу после отправки ответа — и на проде эта
+  // гонка проигрывается (22.10.2026: cron→звено1 доходило, а звено1→звено2
+  // — уже нет; хентай-цепочка после крона вообще не стартовала). after() —
+  // платформенная гарантия: код выполнится ПОСЛЕ отправки ответа, пока
+  // инвок ещё жив. Запросу достаточно уйти в роутер (миллисекунды) —
+  // следующее звено дальше живёт своей жизнью независимо от контейнера.
+  try {
+    after(fire);
+  } catch {
+    // Вне контекста запроса (юнит-тесты, скрипты) — прямой фолбэк
+    fire();
+  }
 }
