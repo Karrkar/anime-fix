@@ -294,7 +294,14 @@ async function runGamesBackfillSegment(
     const fb = fetchTimeBudget(deadlineMs);
     if (!fb) break;
     const html = await fetchPage(url, fb.retries, Math.min(12_000, fb.timeoutMs));
-    if (!html || html.length < 5000) {
+    // xxx-igra — компактные страницы (сырой HTML ~7КБ, Jina-рендер ещё
+    // меньше): порог 5000 отбраковывал ВАЛИДНЫЕ страницы как «отказ fetch»,
+    // и сегмент умирал мгновенно на первом шаге (инцидент 22.10.2026,
+    // две мгновенные смерти после re-kick). Достаточно отсечь Jina-ошибки
+    // (~200-300 байт JSON) и пустые ответы; «источник исчерпан» определяется
+    // ПАРСИНГОМ (0 игр × 2 подряд), а не размером ответа.
+    const minLen = source === 'xxx' ? 800 : 5000;
+    if (!html || html.length < minLen) {
       fetchFails++;
       if (fetchFails >= 3) {
         console.log(`Backfill games: fetch failed x${fetchFails} at ${url}, stopping segment`);
