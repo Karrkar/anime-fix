@@ -14,7 +14,7 @@ import { HomePage } from '@/components/pages/HomePage';
 import { ProfilePage } from '@/components/pages/ProfilePage';
 import { SearchPage } from '@/components/pages/SearchPage';
 import { WatchPage } from '@/components/pages/WatchPage';
-import { Anime, FavUpdate, Page } from '@/lib/client-types';
+import { Anime, FavUpdate, Page, HomeInitialData } from '@/lib/client-types';
 import { apiFetch, authHeaders, computeFavUpdates, readFavSnapshot, writeFavSnapshot } from '@/lib/client-utils';
 
 // Hash-роутинг разделов: /#catalog, /#search, /#favorites, /#history, /#profile, /#hentai —
@@ -43,7 +43,9 @@ function urlForPage(p: Page): string {
   return p === 'home' ? '/' : `/#${p}`;
 }
 
-export default function App() {
+// initialHome — серверные данные главной (SSR от page.tsx): полки видны в HTML
+// до загрузки JS; без них (БД недоступна) HomePage работает как раньше.
+export default function App({ initialHome }: { initialHome?: HomeInitialData | null }) {
   const [page, setPage] = useState<Page>('home');
   const [watchId, setWatchId] = useState<string | null>(null);
   const [watchEp, setWatchEp] = useState(1); // с какой серии стартовать (resume)
@@ -195,7 +197,7 @@ export default function App() {
       <main className={`flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-4 sm:py-6 ${!isWatchPage ? 'pb-20 md:pb-6' : 'pb-6'}`}>
         <AnimatePresence mode="wait">
           <motion.div key={page + (watchId || '')} initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -10 }} transition={{ duration: 0.2 }}>
-            {page === 'home' && <HomePage onNavigate={navigate} onOpen={openAnime} favorites={favorites} favUpdates={favUpdates} onMarkAllFavSeen={markAllFavSeen} />}
+            {page === 'home' && <HomePage onNavigate={navigate} onOpen={openAnime} favorites={favorites} favUpdates={favUpdates} onMarkAllFavSeen={markAllFavSeen} initialHome={initialHome} />}
             {page === 'catalog' && <CatalogPage onOpen={openAnime} favorites={favorites} />}
             {page === 'search' && <SearchPage onOpen={openAnime} favorites={favorites} />}
             {page === 'watch' && watchId && <WatchPage key={watchId} animeId={watchId} initialEp={watchEp} onBack={goBack} onOpen={openAnime} favorites={favorites} toggleFav={toggleFav} />}

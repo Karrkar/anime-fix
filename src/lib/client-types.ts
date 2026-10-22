@@ -32,6 +32,16 @@ export interface Anime {
   sourceUrl?: string;
 }
 
+// ─── Серверные данные для главной (SSR) ───────────────────────────────────
+// page.tsx (сервер) получает полки из БД и передаёт их в App → HomePage:
+// контент виден прямо в HTML до загрузки JS — и даже если JS у клиента
+// не выполнился (старый кэш чанков, медленная сеть, сбой гидрации).
+export interface HomeInitialData {
+  trending: Anime[];
+  fresh: Anime[];
+  recent: Anime[];
+}
+
 export interface ArtItem {
   id: string;
   title: string;

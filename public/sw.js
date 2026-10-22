@@ -1,23 +1,31 @@
 /*
  * Service Worker AnimePlatform (PWA).
  *
+ * v4 (ap-v4): то же поведение, что v3, но смена версии при деплее —
+ * браузер видит новые байты sw.js → ставит апдейт → activate вычищает ВСЕ
+ * старые кэши (в т.ч. застрявшие чанки старых сборок) → clients.claim()
+ * переводит открытые вкладки под новый SW. Это лечит «замурованную» вкладку
+ * со старым HTML/чанками после серии деплоев.
+ *
  * Стратегии:
  *  - /_next/static/*, /icons/*, /logo.svg, /favicon.ico → cache-first (неменные хэшируемые ассеты)
  *  - навигация (HTML) → network-first, офлайн-фолбэк на закэшированную «/»
  *  - /api/* → СЕТЬ ТОЛЬКО (никогда не кэшируем: чат, гейты, каталог меняются)
  *  - постеры и прочие картинки → cache-first c лимитом записей
- *
- * Версия CACHE_VERSION: при деплое нового кода Next меняет хэши статики,
- * но старые записи всё равно чистим активацией (cleanup old caches).
  */
-const CACHE_VERSION = 'ap-v3';
+const CACHE_VERSION = 'ap-v4';
 const STATIC_CACHE = `${CACHE_VERSION}-static`;
 const IMG_CACHE = `${CACHE_VERSION}-img`;
 const IMG_CACHE_MAX = 120;
 
 self.addEventListener('install', (event) => {
+  // allSettled вместо addAll: апдейт SW обязан встать ЛЮБОЙ ценой — иначе
+  // старая версия не заменится и лечение не сработает. Частичная неудача
+  // префетча оболочки не должна блокировать установку v4.
   event.waitUntil(
-    caches.open(STATIC_CACHE).then((c) => c.addAll(['/', '/logo.svg', '/favicon.ico'])).then(() => self.skipWaiting())
+    caches.open(STATIC_CACHE)
+      .then((c) => Promise.allSettled([c.add('/'), c.add('/logo.svg'), c.add('/favicon.ico')]))
+      .then(() => self.skipWaiting())
   );
 });
 

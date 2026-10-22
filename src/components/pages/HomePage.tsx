@@ -7,17 +7,22 @@ import { AnimeCard } from '@/components/cards/AnimeCard';
 import { FavUpdatesShelf } from '@/components/shelves/FavUpdatesShelf';
 import { ResumeShelf } from '@/components/shelves/ResumeShelf';
 import { SkeletonGrid, SkeletonLine } from '@/components/ui';
-import { Anime, FavUpdate, Page, ResumeItem } from '@/lib/client-types';
+import { Anime, FavUpdate, HomeInitialData, Page, ResumeItem } from '@/lib/client-types';
 import { apiFetch } from '@/lib/client-utils';
 
-export function HomePage({ onNavigate, onOpen, favorites, favUpdates, onMarkAllFavSeen }: { onNavigate: (p: Page) => void; onOpen: (id: string, ep?: number) => void; favorites: Set<string>; favUpdates: FavUpdate[]; onMarkAllFavSeen: () => void }) {
-  const [trending, setTrending] = useState<Anime[]>([]);
-  const [fresh, setFresh] = useState<Anime[]>([]);
-  const [recent, setRecent] = useState<Anime[]>([]);
+export function HomePage({ onNavigate, onOpen, favorites, favUpdates, onMarkAllFavSeen, initialHome }: { onNavigate: (p: Page) => void; onOpen: (id: string, ep?: number) => void; favorites: Set<string>; favUpdates: FavUpdate[]; onMarkAllFavSeen: () => void; initialHome?: HomeInitialData | null }) {
+  // Серверные данные (SSR): если они есть — полки отрисованы в HTML сразу,
+  // скелетоны не показываем. Клиентский рефетч ниже освежает данные вживую.
+  const hasInitial = !!(initialHome && (initialHome.trending.length || initialHome.fresh.length || initialHome.recent.length));
+  const [trending, setTrending] = useState<Anime[]>(initialHome?.trending ?? []);
+  const [fresh, setFresh] = useState<Anime[]>(initialHome?.fresh ?? []);
+  const [recent, setRecent] = useState<Anime[]>(initialHome?.recent ?? []);
   const [resume, setResume] = useState<ResumeItem[]>([]);
-  const [loaded, setLoaded] = useState(false);
+  const [loaded, setLoaded] = useState(hasInitial);
   const [randomLoading, setRandomLoading] = useState(false);
 
+  // Рефетч вживую (поверх SSR-данных): обновляет полки в долгоживущих вкладках
+  // и работает как фолбэк, когда серверных данных не было (БД недоступна).
   useEffect(() => {
     let alive = true;
     Promise.all([
