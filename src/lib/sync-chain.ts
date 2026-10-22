@@ -184,17 +184,17 @@ export function fireChainNext(url: string): void {
       'user-agent': 'Mozilla/5.0 (compatible; AnimePlatformSyncChain/1.0)',
     };
     if (secret) headers.authorization = `Bearer ${secret}`;
-    for (let attempt = 0; attempt < 2; attempt++) {
+    for (let attempt = 0; attempt < 3; attempt++) {
       try {
         const r = await fetch(url, { headers, redirect: 'follow' });
         // Заголовки пришли — закрываем тело за собой, не читая
         try { r.body?.cancel(); } catch { /* уже закрыт */ }
         if (r.ok) return; // звено принято роутом
-        // 403/5xx (CF-челлендж, платформенный сбой) — повтор через секунду
+        // 403/5xx (CF-челлендж, платформенный сбой) — повтор через 2с
       } catch { /* сеть — повтор */ }
-      await new Promise(res => setTimeout(res, 1_000));
+      await new Promise(res => setTimeout(res, 2_000));
     }
-    // обе попытки не прошли — курсор в sync_status подхватит следующий крон
+    // все попытки не прошли — курсор в sync_status подхватит следующий крон
   };
 
   try {
