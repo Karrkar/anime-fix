@@ -122,6 +122,29 @@ export function buildChainUrl(
   return `${CHAIN_ORIGIN}${path}${qs ? `?${qs}` : ''}`;
 }
 
+/** Бюджет времени на СЛЕДУЮЩИЙ fetch сегмента с учётом «твёрдого» конца
+ * инвока (60с Hobby-план = дедлайн сегмента 44с + 13с страховки = 57с).
+ *
+ * ЗАЧЕМ: без клампа один медленный fetch (20с таймаут × 2 попытки = 41с),
+ * начавшийся у дедлайна, вылезает за жёсткий лимит функции — инвок убит
+ * ДО сохранения курсора и передачи цепочки (прод-инцидент 22.10.2026:
+ * vost-цепочка умерла на стр. 42 именно так). С бюджетом худший конец
+ * fetch ≈ 53с, остаётся время на апсерт + save + fire.
+ *
+ * Возвращает null, если времени не хватает даже на самую короткую попытку.
+ */
+export function fetchTimeBudget(
+  deadlineMs: number,
+  hardEndMs?: number,
+): { timeoutMs: number; retries: number } | null {
+  const hardEnd = hardEndMs ?? deadlineMs + 13_000;
+  const usable = hardEnd - 4_000 - Date.now(); // окно на всю fetch-цепочку
+  if (usable >= 42_000) return { timeoutMs: 20_000, retries: 1 }; // 2×20+1с = 41с
+  if (usable >= 22_000) return { timeoutMs: 10_000, retries: 1 }; // 2×10+1с = 21с
+  if (usable >= 10_000) return { timeoutMs: 9_000, retries: 0 };  // 1×9с
+  return null;
+}
+
 /**
  * Пнуть следующее звено. Fire-and-forget: ответ НЕ ждём телом — достаточно
  * факта маршрутизации запроса платформой (миллисекунды), дальше новое

@@ -6,7 +6,7 @@ import { notifyTelegram } from '@/lib/notify';
 import { recordSyncRun } from '@/lib/sync-status';
 import { FEELEX_BASE, XXX_IGRA_BASE, JINA_READER } from '@/lib/sources'; // F-27: единый реестр
 import { jinaHeaders, markJinaKeyRejected } from '@/lib/jina';
-import { buildChainUrl, fireChainNext } from '@/lib/sync-chain';
+import { buildChainUrl, fireChainNext, fetchTimeBudget } from '@/lib/sync-chain';
 
 export const maxDuration = 60;
 
@@ -43,12 +43,12 @@ const FEELEX_PAGE_HARD_CAP = 30;
 // синк игр регулярно убивало по таймауту (504 FUNCTION_INVOCATION_TIMEOUT) —
 // до записи sync_status дело не доходило. Теперь: один fetch ≤12с, попыток ≤2
 // (худший случай ~25с), дедлайн на старт новых fetch — 30с.
-async function fetchPage(url: string, retries = 1): Promise<string> {
+async function fetchPage(url: string, retries = 1, timeoutMs = 12000): Promise<string> {
   for (let i = 0; i <= retries; i++) {
     try {
       const r = await fetch(JINA_READER + encodeURIComponent(url), {
         headers: jinaHeaders(),
-        signal: AbortSignal.timeout(12000),
+        signal: AbortSignal.timeout(timeoutMs),
       });
       if (r.ok) return await r.text();
       if (r.status === 401 || r.status === 402) markJinaKeyRejected(r.status);
@@ -290,7 +290,10 @@ async function runGamesBackfillSegment(
       source = 'feelex';
     }
 
-    const html = await fetchPage(url);
+    // Клампим бюджет fetch под остаток жизни инвока (инцидент 22.10.2026)
+    const fb = fetchTimeBudget(deadlineMs);
+    if (!fb) break;
+    const html = await fetchPage(url, fb.retries, Math.min(12_000, fb.timeoutMs));
     if (!html || html.length < 5000) {
       fetchFails++;
       if (fetchFails >= 3) {

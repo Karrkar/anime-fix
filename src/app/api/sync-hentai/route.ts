@@ -8,6 +8,7 @@ import { HB_BASE, JINA_READER } from '@/lib/sources'; // F-27: домены из
 import { jinaHeaders, markJinaKeyRejected } from '@/lib/jina';
 import {
   buildChainUrl,
+  fetchTimeBudget,
   fireChainNext,
   loadBackfillState,
   saveBackfillState,
@@ -165,7 +166,10 @@ async function runBackfillSegment(
       break;
     }
     const url = page === 1 ? `${HB_BASE}/` : `${HB_BASE}/?page=${page}`;
-    const html = await fetchPage(url, 1, 20000);
+    // Клампим бюджет fetch под остаток жизни инвока (инцидент 22.10.2026)
+    const fb = fetchTimeBudget(deadlineMs);
+    if (!fb) break;
+    const html = await fetchPage(url, fb.retries, fb.timeoutMs);
     if (!html || html.length < 5000) {
       fetchFails++;
       if (fetchFails >= 2) {

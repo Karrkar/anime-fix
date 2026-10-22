@@ -9,6 +9,7 @@ import { jinaHeaders, markJinaKeyRejected } from '@/lib/jina';
 import {
   buildChainUrl,
   emptyBackfillState,
+  fetchTimeBudget,
   fireChainNext,
   loadBackfillState,
   saveBackfillState,
@@ -277,7 +278,11 @@ async function runBackfillSegment(
       break;
     }
     const url = `${VOST_BASE}/page/${page}/`;
-    const html = await fetchPage(url, 1, 20000);
+    // Клампим бюджет fetch под остаток жизни инвока — медленная страница
+    // не должна убить звено до сохранения курсора (инцидент 22.10.2026)
+    const fb = fetchTimeBudget(deadlineMs);
+    if (!fb) break;
+    const html = await fetchPage(url, fb.retries, fb.timeoutMs);
     if (!html || html.length < 5000) {
       // Сеть/Jina недоступны — это НЕ «конец источника»: страницу не засчитываем,
       // после двух отказов подряд останавливаем сегмент (источник нездоров).

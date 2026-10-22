@@ -6,7 +6,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
 import { normalizeVostDomain, VOST_BASE, PLAYER_PROXY_ALLOWED_HOSTS } from '../src/lib/sources';
-import { buildChainUrl } from '../src/lib/sync-chain';
+import { buildChainUrl, fetchTimeBudget } from '../src/lib/sync-chain';
 
 // ─── normalizeVostDomain ───────────────────────────────────────────────
 
@@ -59,4 +59,45 @@ test('buildChainUrl: пустые и undefined параметры не попа�
 test('buildChainUrl: без параметров — без вопросительного знака', () => {
   const url = buildChainUrl('/api/watchdog', {});
   assert.ok(!url.includes('?'));
+});
+
+// ─── fetchTimeBudget (кламп fetch под твёрдый лимит инвока) ───────────
+
+test('fetchTimeBudget: в начале сегмента — полный бюджет (20с, 1 ретрай)', () => {
+  const now = Date.now();
+  const fb = fetchTimeBudget(now, now + 57_000); // инвок только начался
+  assert.ok(fb, 'бюджет должен быть');
+  assert.equal(fb.timeoutMs, 20_000);
+  assert.equal(fb.retries, 1);
+});
+
+test('fetchTimeBudget: у дедлайна бюджет падает до 10с/1 ретрай', () => {
+  const now = Date.now();
+  const fb = fetchTimeBudget(now, now + 30_000); // осталось ~26с usable
+  assert.ok(fb);
+  assert.equal(fb.timeoutMs, 10_000);
+  assert.equal(fb.retries, 1);
+});
+
+test('fetchTimeBudget: в последней фазе — одна быстрая попытка без ретраев', () => {
+  const now = Date.now();
+  const fb = fetchTimeBudget(now, now + 15_000); // usable ~11с
+  assert.ok(fb);
+  assert.equal(fb.retries, 0);
+  assert.ok(fb.timeoutMs <= 10_000);
+});
+
+test('fetchTimeBudget: времени нет — null (сегмент завершается с сохранением)', () => {
+  const now = Date.now();
+  assert.equal(fetchTimeBudget(now, now + 8_000), null);
+  assert.equal(fetchTimeBudget(now, now - 1_000), null); // уже за твёрдым концом
+});
+
+test('fetchTimeBudget: hardEnd по умолчанию = дедлайн + 13с', () => {
+  // дедлайн «сейчас + 31с» → hardEnd = +44с → usable ~40с (< 42с порога) → 10с
+  const deadline = Date.now() + 31_000;
+  const fb = fetchTimeBudget(deadline);
+  assert.ok(fb);
+  assert.equal(fb.timeoutMs, 10_000);
+  assert.equal(fb.retries, 1);
 });
