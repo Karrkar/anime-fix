@@ -65,7 +65,7 @@ test('buildChainUrl: без параметров — без вопросител
 
 test('fetchTimeBudget: в начале сегмента — полный бюджет (20с, 1 ретрай)', () => {
   const now = Date.now();
-  const fb = fetchTimeBudget(now, now + 57_000); // инвок только начался
+  const fb = fetchTimeBudget(now, now + 50_000); // инвок только начался (usable ~46с)
   assert.ok(fb, 'бюджет должен быть');
   assert.equal(fb.timeoutMs, 20_000);
   assert.equal(fb.retries, 1);
@@ -87,14 +87,22 @@ test('fetchTimeBudget: в последней фазе — одна быстра�
   assert.ok(fb.timeoutMs <= 10_000);
 });
 
+test('fetchTimeBudget: финишный рывок — 5с без ретраев', () => {
+  const now = Date.now();
+  const fb = fetchTimeBudget(now, now + 11_000); // usable ~7с
+  assert.ok(fb);
+  assert.equal(fb.timeoutMs, 5_000);
+  assert.equal(fb.retries, 0);
+});
+
 test('fetchTimeBudget: времени нет — null (сегмент завершается с сохранением)', () => {
   const now = Date.now();
   assert.equal(fetchTimeBudget(now, now + 8_000), null);
   assert.equal(fetchTimeBudget(now, now - 1_000), null); // уже за твёрдым концом
 });
 
-test('fetchTimeBudget: hardEnd по умолчанию = дедлайн + 13с', () => {
-  // дедлайн «сейчас + 31с» → hardEnd = +44с → usable ~40с (< 42с порога) → 10с
+test('fetchTimeBudget: hardEnd по умолчанию = дедлайн + 6с', () => {
+  // дедлайн «сейчас + 31с» → hardEnd = +37с → usable ~33с (< 42с порога) → 10с
   const deadline = Date.now() + 31_000;
   const fb = fetchTimeBudget(deadline);
   assert.ok(fb);
