@@ -14,11 +14,19 @@
  *
  * F-11 (было): getClientIp брал первую запись x-forwarded-for — клиентского
  * заголовка, который можно подделать, а всех без адреса клал в одну корзину
- * "unknown" (легитимные пользователи блокировали друг друга). Теперь:
- *  1) приоритет у x-real-ip — его проставляет сама платформа Vercel;
- *  2) fallback x-forwarded-for (первая запись — на Vercel это клиент);
- *  3) если адреса нет вовсе — псевдо-ID из user-agent, чтобы анонимы
- *     не делили одну корзину.
+ * "unknown" (легитимные пользователи блокировали друг друга).
+ *
+ * ФИКС ОКТЯБРЬ 2026 (подтверждено аудитом: rate_limits в БД хранит только
+ * IP Cloudflare — 172.71.x, 104.23.x, 162.158.x — и реальный клиент под
+ * этим не виден): у сайта включён прокси Cloudflare (оранжевое облако в
+ * DNS), поэтому С ВЕРСИ VERCEL ФУНКЦИИ «клиентом» выглядит край CDN
+ * Cloudflare. x-forwarded-for на Vercel содержит адрес СОЕДИНЕНИЯ
+ * (edge-ноду Cloudflare), а не посетителя: все пользователи сайта
+ * делят несколько корзин чужих IP -> массовые ложные 429 и обратимый
+ * злоумышленником лимит. Решение — тот же заголовок, которым пользуется
+ * сам Cloudflare: CF-Connecting-IP. Cloudflare гарантированно
+ * перезаписывает его значением реального посетителя (подделка снаружи
+ * через CF-путь невозможна), поэтому он проверяется ПЕРВЫМ.
  */
 import { createHash } from 'crypto'
 import { getDb } from './db'
@@ -46,23 +54,87 @@ export const RATE_LIMITS: Record<string, RateLimitConfig> = {
   '/api/chat': { windowMs: 60_000, maxRequests: 12 }, // чат с Лилит: LLM-вызовы дороги
 }
 
-// ─── F-11: корректный адрес клиента ────────────────────────────────────────
-export function getClientIp(request: Request): string {
-  // 1) x-real-ip ставит сама платформа Vercel — подделать нельзя
-  const real = request.headers.get('x-real-ip')
-  if (real && real.trim()) return real.trim()
+// ─── F-11 + CF-фикс: корректный адрес клиента ─────────────────────────────
+// Порядок доверия (первый непустой валидный выигрывает):
+//   1) cf-connecting-ip — ставит Cloudflare, перезаписывая клиентское
+//      значение: реальный посетитель для любого запроса через наш домен
+//      (прокси-облако в DNS включено). Основной источник.
+//   2) true-client-ip — Cloudflare Enterprise (задел на будущее).
+//   3) x-real-ip — не платформенный на Vercel, но сохранил совместимость
+//      со старым кодом; приоритет ниже, т.к. подделывается клиентом
+//      при прямом заходе мимо Cloudflare.
+//   4) x-forwarded-for (первая запись) — последний эшелон: без CF-прокси
+//      Vercel кладёт сюда адрес соединения.
+// Нигде не валидное значение (мусор/спуф) — пропускаем, чтобы мусор
+// не отравлял корзину честного IP.
 
-  // 2) x-forwarded-for: на Vercel первая запись — фактический клиент
-  const fwd = request.headers.get('x-forwarded-for')
-  if (fwd) {
-    const first = fwd.split(',')[0]?.trim()
-    if (first) return first
+const IPV4_RE = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/;
+const IPV6_RE = /^[0-9a-f]{1,4}(?::[0-9a-f]{0,4}){1,7}$|^(?:::[0-9a-f:.]*)$/;
+
+function isIpv4(s: string): boolean {
+  const m = s.match(IPV4_RE);
+  if (!m) return false;
+  return [m[1], m[2], m[3], m[4]].every(o => Number(o) <= 255);
+}
+
+function isIpv6(s: string): boolean {
+  if (!s.includes(':')) return false;
+  // Прагматичная проверка: hex-группы + двоеточия (+ встроенный IPv4 хвост)
+  return IPV6_RE.test(s) || /^[0-9a-f:]+(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})?$/i.test(s) && (s.match(/::/g)?.length ?? 0) <= 1;
+}
+
+/** Нормализация кандидата: снять порт, проверить на валидный IP.
+ *  Возвращает готовый к использованию адрес или null (не IP вовсе). */
+export function normalizeIpCandidate(raw: string | null | undefined): string | null {
+  if (!raw) return null;
+  let v = raw.trim();
+  if (!v) return null;
+  // Несколько значений в одном заголовке ("a, b") — берём первое
+  const comma = v.indexOf(',');
+  if (comma > -1) v = v.slice(0, comma).trim();
+  if (!v) return null;
+  // "[2001:db8::1]:5678" -> "2001:db8::1"
+  if (v.startsWith('[')) {
+    const end = v.indexOf(']');
+    if (end > -1) v = v.slice(1, end);
   }
+  // "203.0.113.7:54321" -> "203.0.113.7" (голый IPv6 порта без скобок не бывает)
+  const withPort = v.match(/^(\d{1,3}(?:\.\d{1,3}){3}):\d{1,5}$/);
+  if (withPort) v = withPort[1];
+  if (!v) return null;
+  if (isIpv4(v)) return v;
+  const lower = v.toLowerCase();
+  if (isIpv6(lower)) return lower;
+  return null;
+}
 
-  // 3) Без адреса: псевдо-ID из user-agent — анонимы не в одной корзине
-  const ua = request.headers.get('user-agent') || ''
-  const h = createHash('sha1').update(ua).digest('hex').slice(0, 16)
-  return `anon-${h}`
+export function getClientIp(request: Request): string {
+  // 1) cf-connecting-ip: Cloudflare перезаписывает — реальный посетитель.
+  //    Пройдя через CF-прокси, ЛЮБОЙ другой заголовок адреса содержит
+  //    edge-IP Cloudflare (что и виделось в БД как 172.71.x/104.23.x).
+  const cfIp = normalizeIpCandidate(request.headers.get('cf-connecting-ip'));
+  if (cfIp) return cfIp;
+
+  // 2) true-client-ip (Cloudflare Enterprise)
+  const tci = normalizeIpCandidate(request.headers.get('true-client-ip'));
+  if (tci) return tci;
+
+  // 3) x-real-ip (не платформенный; сохранён для совместимости — приоритет
+  //    ниже, т.к. подделывается клиентом при прямом заходе мимо Cloudflare)
+  const real = normalizeIpCandidate(request.headers.get('x-real-ip'));
+  if (real) return real;
+
+  // 4) x-forwarded-for: без CF-прокси Vercel кладёт сюда адрес соединения.
+  //    Первая запись может быть подделана клиентом при прямом заходе,
+  //    но валидация хотя бы отсекает мусор.
+  const fwdFirst = request.headers.get('x-forwarded-for')?.split(',')[0];
+  const fwdIp = normalizeIpCandidate(fwdFirst);
+  if (fwdIp) return fwdIp;
+
+  // 5) Без адреса: псевдо-ID из user-agent — анонимы не в одной корзине
+  const ua = request.headers.get('user-agent') || '';
+  const h = createHash('sha1').update(ua).digest('hex').slice(0, 16);
+  return `anon-${h}`;
 }
 
 // ─── In-memory fallback (исправленный: без setInterval, с границей) ───────
