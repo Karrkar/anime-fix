@@ -24,8 +24,32 @@
       "schedule": "30 6 * * *"
     },
     {
-      "path": "/api/creative-sync?depth=2&mirror=40",
+      "path": "/api/creative-sync?depth=8&mirror=80",
       "schedule": "0 7 * * *"
+    },
+    {
+      "path": "/api/creative-sync?channel=the_horny_ai&depth=2&mirror=60",
+      "schedule": "30 9 * * *"
+    },
+    {
+      "path": "/api/creative-sync?channel=simple_elf&depth=4&mirror=50",
+      "schedule": "30 11 * * *"
+    },
+    {
+      "path": "/api/creative-sync?channel=neyroanime&depth=4&mirror=50",
+      "schedule": "30 13 * * *"
+    },
+    {
+      "path": "/api/creative-sync?channel=neuroart1215&depth=2&mirror=60",
+      "schedule": "30 15 * * *"
+    },
+    {
+      "path": "/api/creative-sync?channel=pornofullp&depth=2&mirror=60",
+      "schedule": "30 17 * * *"
+    },
+    {
+      "path": "/api/creative-sync?channel=stefanfalkokmoth&depth=2&mirror=60",
+      "schedule": "30 19 * * *"
     },
     {
       "path": "/api/player-warm?slice=0",

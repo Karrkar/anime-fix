@@ -21,8 +21,11 @@ import { isArtPost, sanitizeCaption } from '@/lib/creative-filter';
 
 // ─── Константы ─────────────────────────────────────────────────────────────
 
-/** Максимум постов на канал в хранилище (глубина истории). */
-export const DEPTH_CAP = 600;
+/** Максимум постов на канал в хранилище (глубина истории).
+ * Было 600 — neyroanime (600) и the_horny_ai (600) упёрлись в потолок,
+ * хотя история ниже ещё не исчерпана (у the_horny_ai ~4900 msgId ниже).
+ * 3000 покрывает оценённые полные глубины всех 8 каналов. */
+export const DEPTH_CAP = 3000;
 /** Страница в режиме одного канала. */
 export const PAGE_SIZE = 24;
 /** Страница в режиме «все каналы» (6 × 24). */
@@ -72,6 +75,10 @@ export interface DepthRow {
   complete: boolean;
   minMsgId: number;
   maxMsgId: number;
+  /** Пол обхода — ниже какого msgId уже прошлись, ДАЖЕ если слой не дал
+   * ни одного арт-поста (видео/текст отфильтровались). Без него каналы с
+   * редкими артами зацикливались на одних и тех же слоях (simple_elf). */
+  walkFloor?: number;
 }
 
 // ─── Нормализация / слияние ────────────────────────────────────────────────
@@ -160,11 +167,15 @@ export function depthRowKey(channel: string): string {
 function rowToDepth(d: Record<string, unknown> | null | undefined): DepthRow | null {
   const posts = (d?.posts as StoredCreativePost[] | undefined) || [];
   if (!Array.isArray(posts) || posts.length === 0) return null;
+  const floorFromPosts = posts[posts.length - 1]?.msgId || 0;
+  const savedFloor = Number(d?.walkFloor || 0);
   return {
     posts,
     complete: !!d?.complete,
-    minMsgId: Number(d?.minMsgId || posts[posts.length - 1]?.msgId || 0),
+    minMsgId: Number(d?.minMsgId || floorFromPosts),
     maxMsgId: Number(d?.maxMsgId || posts[0]?.msgId || 0),
+    // Пол обхода не может быть ВЫШЕ пола постов — иначе потеряем прогресс
+    walkFloor: savedFloor > 0 ? Math.min(savedFloor, floorFromPosts) : floorFromPosts,
   };
 }
 
@@ -189,9 +200,11 @@ export async function saveDepth(
   channel: string,
   posts: StoredCreativePost[],
   complete: boolean,
+  walkFloor?: number,
 ): Promise<void> {
   if (!posts.length) return;
   const capped = posts.slice(0, DEPTH_CAP);
+  const postsFloor = capped[capped.length - 1].msgId;
   try {
     const db = getDb();
     const row = {
@@ -204,8 +217,11 @@ export async function saveDepth(
         posts: capped,
         savedAt: new Date().toISOString(),
         complete: complete && capped.length >= DEPTH_CAP ? true : complete,
-        minMsgId: capped[capped.length - 1].msgId,
+        minMsgId: postsFloor,
         maxMsgId: capped[0].msgId,
+        // Пол обхода: ниже этого msgId уже прошлись (даже если слой был пуст
+        // от артов) — при следующем запуске продолжаем СЮДА, а не заново
+        walkFloor: Math.min(walkFloor && walkFloor > 0 ? walkFloor : postsFloor, postsFloor),
       },
       error: null,
     };

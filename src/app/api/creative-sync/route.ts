@@ -51,6 +51,11 @@ const DEEP_MIRROR_PER_CHANNEL = 12;
 
 const ROTATION_SOURCE = 'creative_rotation';
 
+/** Время старта текущего инвока (мс). Выставляется хендлером; walkChannel
+ *  использует его для дедлайнов (слои и зеркала не должны съедать бюджет,
+ *  иначе saveDepth не успевает и прогресс теряется при убиении на 60с). */
+let t0Global = 0;
+
 async function loadRotationCursor(): Promise<number> {
   try {
     const db = getDb();
@@ -103,6 +108,10 @@ async function walkChannel(
   /** light=true — проход «только свежесть»: без глубины/зеркал; сохранение,
    *  только если что-то добавилось (иначе мегабайтные апсерты впустую). */
   light = false,
+  /** Дедлайн инвока (мс от старта хендлера): зеркалирование останавливается
+   *  ДО него, чтобы saveDepth успел записать прогресс — иначе при убиении
+   *  функции на 60с терялась и глубина, и зеркала (Hobby maxDuration=60). */
+  deadlineMs?: number,
 ): Promise<ChannelResult> {
   const res: ChannelResult = {
     channel, liveOk: false, freshAdded: 0, deepAdded: 0,
@@ -112,6 +121,10 @@ async function walkChannel(
   const depth = await loadDepth(channel);
   let posts: StoredCreativePost[] = depth?.posts || [];
   const beforeCount = posts.length;
+  // Пол обхода: там, где уже прошлись. Может быть НИЖЕ пола постов —
+  // слои из видео/текста не дают арт-постов, но обход должен идти ниже
+  // (иначе simple_elf зацикливался: 25 постов и минус 8000 msgId истории).
+  let walkFloor = depth?.walkFloor || (posts.length ? posts[posts.length - 1].msgId : 0);
 
   // 1) Свежий слой (мусорные посты — текст/реклама/кросс-промо — отбрасываются)
   const fresh = await fetchChannelLayerLive(channel);
@@ -127,17 +140,22 @@ async function walkChannel(
     }
   }
 
-  // 2) Слои вглубь
+  // 2) Слои вглубь — от ПОЛА ОБХОДА, а не от пола постов
   let layers = 0;
   let complete = depth?.complete || posts.length >= DEPTH_CAP;
   while (layers < depthLayers && posts.length < DEPTH_CAP && !complete) {
-    const minSaved = posts.length ? posts[posts.length - 1].msgId : 0;
-    if (!minSaved) break;
-    const layer = await fetchChannelLayerLive(channel, minSaved - 1);
+    if (!walkFloor) break;
+    // Страховка времени: каждый слой ~2-3с; не начинаем слой, если до
+    // дедлайна меньше 8с (слой + нормализация + слияние должны влезть)
+    if (deadlineMs && Date.now() - t0Global > deadlineMs - 8000) break;
+    const layer = await fetchChannelLayerLive(channel, walkFloor - 1);
     if (layer === null) break;              // сеть/троттлинг — тише едешь
     if (layer === '') { complete = true; break; } // пол истории
     const layerMax = layer[0]?.msgId || 0;
-    if (layerMax >= minSaved) { complete = true; break; } // t.me не отдал ниже
+    if (layerMax >= walkFloor) { complete = true; break; } // t.me не отдал ниже
+    // Пол обхода двигается ВНИЗ независимо от того, дал ли слой арты —
+    // иначе каналы с видео-промежутками застревали на одном месте вечно
+    walkFloor = layer[layer.length - 1].msgId;
     const normalized = layer
       .map(r => normalizePost(r, channel))
       .filter((p): p is StoredCreativePost => p !== null);
@@ -150,23 +168,24 @@ async function walkChannel(
   }
   if (posts.length >= DEPTH_CAP) complete = true;
 
-  // 3) Зеркальный бюджет — сверху вниз по незеркалированным
+  // 3) Зеркальный бюджет — сверху вниз по незеркалированным.
+  //    ЖЁСТКИЙ дедлайн: зеркалирование — самая долгая часть (~2с/картинка),
+  //    без остановки оно съедало весь бюджет инвока и saveDepth не успевал.
   if (mirrorBudget > 0) {
     for (let i = 0; i < posts.length && res.mirroredImages < mirrorBudget; i++) {
+      if (deadlineMs && Date.now() - t0Global > deadlineMs) break;
       if (!posts[i].mirrored) {
-        const before = posts[i].photos.filter(u => u).length;
         posts[i] = await mirrorPostMedia(posts[i]);
         const done = posts[i].photos.filter(u => u.includes('/storage/v1/object/public/covers/creative/')).length;
         if (done > 0) {
           res.mirroredPosts++;
           res.mirroredImages += done;
         }
-        void before;
       }
     }
   }
 
-  // 4) Сохранение + телеметрия
+  // 4) Сохранение + телеметрия (пол обхода — в БД, чтобы не ходить по кругу)
   posts.sort((a, b) => b.msgId - a.msgId);
   if (light && res.freshAdded === 0) {
     // Ничего не изменилось — состояние в БД уже актуально, не тратим
@@ -175,7 +194,7 @@ async function walkChannel(
     res.depthComplete = complete && posts.length >= DEPTH_CAP;
     return res;
   }
-  await saveDepth(channel, posts, complete);
+  await saveDepth(channel, posts, complete, walkFloor);
   res.postsTotal = posts.length;
   res.depthComplete = complete && posts.length >= DEPTH_CAP;
   return res;
@@ -191,10 +210,11 @@ async function creativeSyncHandler(request: NextRequest) {
   }
 
   const t0 = Date.now();
+  t0Global = t0;
   const { searchParams } = new URL(request.url);
 
   const depthParam = Number(searchParams.get('depth') ?? 2);
-  const depthLayers = Math.max(0, Math.min(8, Number.isFinite(depthParam) ? Math.floor(depthParam) : 2));
+  const depthLayers = Math.max(0, Math.min(16, Number.isFinite(depthParam) ? Math.floor(depthParam) : 2));
 
   const mirrorParam = Number(searchParams.get('mirror') ?? 30);
   const mirrorBudget = Math.max(0, Math.min(80, Number.isFinite(mirrorParam) ? Math.floor(mirrorParam) : 30));
@@ -208,7 +228,9 @@ async function creativeSyncHandler(request: NextRequest) {
   if (channelParam) {
     const results: ChannelResult[] = [];
     try {
-      results.push(await walkChannel(channelParam, depthLayers, mirrorBudget));
+      // Дедлайн 50с: ходока останавливаем на 42с (слои), зеркала на 50с,
+      // остаёмся внутри maxDuration=60 с запасом на saveDepth (мегабайтные апсерты)
+      results.push(await walkChannel(channelParam, depthLayers, mirrorBudget, false, 50_000));
     } catch (e) {
       console.error(`creative-sync walk (${channelParam}):`, e);
       results.push({
@@ -250,7 +272,7 @@ async function creativeSyncHandler(request: NextRequest) {
     const ch = TG_CHANNELS[idx].id;
     try {
       deepResults.push(
-        await walkChannel(ch, depthLayers, Math.min(mirrorBudget, DEEP_MIRROR_PER_CHANNEL)),
+        await walkChannel(ch, depthLayers, Math.min(mirrorBudget, DEEP_MIRROR_PER_CHANNEL), false, 44_000),
       );
     } catch (e) {
       console.error(`creative-sync deep (${ch}):`, e);
