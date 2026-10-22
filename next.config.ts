@@ -12,7 +12,16 @@ const supabaseOrigin = (() => {
   }
 })();
 
+// Уникальный ID сборки: меняется при каждом деплое → попадает в URL регистрации
+// service worker (/sw.js?b=XXX) → Cloudflare никогда не отдаёт браузеру
+// закэшированную старую версию файла автопочинки.
+const BUILD_ID = Date.now().toString(36);
+
 const nextConfig: NextConfig = {
+  generateBuildId: () => BUILD_ID,
+  env: {
+    NEXT_PUBLIC_BUILD_ID: BUILD_ID,
+  },
   // F-24 fix: страховки компилятора и React возвращены.
   // typescript.ignoreBuildErrors удалён (раньше ошибки типов молча попадали в
   // production — так прошёл баг вебхука body→n и лишний [] в useState),

@@ -1,8 +1,10 @@
 /*
  * Service Worker Anime Platforma (PWA).
  *
- * v6 (ap-v6): sw.js отдаётся с Cache-Control: no-cache (vercel.json headers, CDN-уровень) —
- * браузер получает свежий SW при каждом заходе, без 4-часового лага CDN.
+ * v7 (ap-v7): версионированная регистрация /sw.js?b=<BUILD_ID> (pwa-register.tsx) —
+ * уникальный URL для каждого деплоя обходит кэш Cloudflare (до 4 часов) НАВСЕГДА:
+ * именно из-за него файл автопочинки не мог добраться до браузеров и «замурованные»
+ * вкладки не лечились, хотя прямой адрес *.vercel.app работал (там нет SW).
  * Смена версии при деплое → апдейт → activate вычищает ВСЕ
  * старые кэши (в т.ч. застрявшие чанки старых сборок) → clients.claim()
  * переводит открытые вкладки под новый SW. Это лечит «замурованную» вкладку
@@ -14,7 +16,7 @@
  *  - /api/* → СЕТЬ ТОЛЬКО (никогда не кэшируем: чат, гейты, каталог меняются)
  *  - постеры и прочие картинки → cache-first c лимитом записей
  */
-const CACHE_VERSION = 'ap-v6'; // v6: no-cache заголовки vercel.json (CDN-уровень) — свежий SW при каждом заходе
+const CACHE_VERSION = 'ap-v7'; // v7: версионированный URL регистрации — обход кэша Cloudflare
 const STATIC_CACHE = `${CACHE_VERSION}-static`;
 const IMG_CACHE = `${CACHE_VERSION}-img`;
 const IMG_CACHE_MAX = 120;
@@ -39,6 +41,12 @@ self.addEventListener('activate', (event) => {
       )
       .then(() => self.clients.claim())
   );
+});
+
+// Подталкивание из страницы (pwa-register.tsx): если SW в waiting,
+// но skipWaiting в install по какой-то причине не сработал.
+self.addEventListener('message', (event) => {
+  if (event.data && event.data.type === 'SKIP_WAITING') self.skipWaiting();
 });
 
 function isStaticAsset(url) {
