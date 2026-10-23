@@ -74,6 +74,10 @@ function dapiToParsed(posts: DapiPost[], artistTag: string): import('@/lib/clien
       rating: typeof p.rating === 'string' ? p.rating : 'explicit',
       title: displayTitle,
       postUrl: `https://rule34.xxx/index.php?page=post&s=view&id=${id}`,
+      // file_url: мгновенный лайтбокс (без /api/rule34-post) + видео-детект
+      ...(typeof p.file_url === 'string' && /^https?:\/\/[a-z0-9.-]+\.rule34\.xxx\//i.test(p.file_url)
+        ? { fullUrl: p.file_url, isVideo: /\.(mp4|webm)(?:\?|$)/i.test(p.file_url) || tags.some(t => t.toLowerCase() === 'animated') }
+        : {}),
     });
   }
   return out;

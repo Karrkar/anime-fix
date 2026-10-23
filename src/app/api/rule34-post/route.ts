@@ -14,6 +14,7 @@ import { BoundedTTLCache } from '@/lib/cache';
 import { logEvent } from '@/lib/logger';
 import { R34_BASE } from '@/lib/sources'; // F-27: домены из единого реестра
 import { fetchSourcePage, isPostPageUsable, R34_POST_SELECTOR } from '@/lib/r34-fetch';
+import { loadPostDetail, savePostDetail, type R34PostDetail } from '@/lib/r34-store';
 
 export const maxDuration = 60;
 
@@ -123,12 +124,28 @@ export async function GET(request: Request) {
     return NextResponse.json(cached.data);
   }
 
+  /* ── Кэш деталок в БД (октябрь 2026): файл поста immutable (хеш в URL) —
+     один раз пробингнули, навсегда закэшировали в r34_post:<id>. Повторное
+     открытие арта на ЛЮБОМ инстансе/устройстве — один дешёвый roundtrip
+     к sync_status вместо перебора 6 расширений по CDN (~1-3с). */
+  const stored = await loadPostDetail(postId);
+  if (stored) {
+    const data: Record<string, unknown> = {
+      id: stored.id, imageUrl: stored.imageUrl, isVideo: stored.isVideo,
+      postUrl: stored.postUrl || `${R34_BASE}/index.php?page=post&s=view&id=${postId}`,
+      tags: (stored.tags && stored.tags.length > 0) ? stored.tags : [],
+      score: stored.score ?? 0,
+    };
+    cache.set(postId, { data, ts: Date.now() });
+    return NextResponse.json(data);
+  }
+
   /* ── Основной путь: пробинг расширений на CDN ───────────────────── */
   if (thumb) {
     try {
       const probe = await probeFullImage(thumb);
       if (probe) {
-        const data: Record<string, unknown> = {
+        const detail: R34PostDetail = {
           id: postId,
           imageUrl: probe.imageUrl,
           isVideo: probe.isVideo,
@@ -136,8 +153,10 @@ export async function GET(request: Request) {
           tags: [], // теги у клиента уже есть из списка — не затираем
           score: 0,
         };
+        const data: Record<string, unknown> = { ...detail };
         cache.set(postId, { data, ts: Date.now() });
         stale.set(postId, data);
+        await savePostDetail(detail); // повторные открытия — мгновенно
         return NextResponse.json(data);
       }
     } catch (e) {

@@ -29,6 +29,8 @@ interface IncomingPost {
   rating?: unknown;
   title?: unknown;
   postUrl?: unknown;
+  isVideo?: unknown;
+  fullUrl?: unknown;
 }
 
 /** Валидация и нормализация поста от клиента (никогда не доверяем вводу). */
@@ -55,6 +57,10 @@ function normalizePost(p: IncomingPost) {
     postUrl: typeof p.postUrl === 'string' && /^https?:\/\/rule34\.xxx\//i.test(p.postUrl)
       ? p.postUrl.slice(0, 200)
       : `https://rule34.xxx/index.php?page=post&s=view&id=${id}`,
+    // dapi file_url: мгновенный лайтбокс + видео-детект (валидируем домен)
+    ...(typeof p.fullUrl === 'string' && /^https?:\/\/[a-z0-9.-]+\.rule34\.xxx\//i.test(p.fullUrl)
+      ? { fullUrl: p.fullUrl.slice(0, 300), isVideo: /\.(mp4|webm)(?:\?|$)/i.test(p.fullUrl) || p.isVideo === true }
+      : (p.isVideo === true ? { isVideo: true } : {})),
   };
 }
 

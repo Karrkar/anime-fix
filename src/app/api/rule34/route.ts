@@ -15,8 +15,9 @@ import { logEvent } from '@/lib/logger';
 import { R34_BASE } from '@/lib/sources'; // F-27: домены из единого реестра
 import { fetchSourcePage, isListPageUsable, R34_LIST_SELECTOR, sleep } from '@/lib/r34-fetch';
 import {
-  getStoredPage, getStoredAggregatePage, getMeta, R34_ARTISTS,
+  getStoredPage, getStoredAggregatePage, getMeta, appendTailPosts, R34_ARTISTS,
 } from '@/lib/r34-store';
+import { fetchDapiPage } from '@/lib/r34-dapi';
 
 export const maxDuration = 60;
 
@@ -30,6 +31,8 @@ interface ParsedPost {
   rating: string;
   title: string;
   postUrl: string;
+  isVideo?: boolean;
+  fullUrl?: string;
 }
 
 const PER_PAGE = 42;
@@ -97,11 +100,15 @@ function parseListPage(html: string, searchTag: string): { posts: ParsedPost[]; 
     const artistTag = tags.find(t => t.toLowerCase() === searchTagLower) ||
       tags.find(t => !t.includes('(') && t !== '1girl' && t !== '1boy' && !t.startsWith('ai '));
     const characterTags = tags.filter(t => t.includes('(') && !t.includes('fate') && !t.includes('series'));
+    // Видео-детект ещё в списке: у видео-постов миниатюра лежит в /videos/
+    // или среди тегов есть 'animated' — бейдж GIF без ожидания деталки
+    const isVideo = thumbSrc.includes('/videos/') || tags.some(t => t.toLowerCase() === 'animated');
     posts.push({
       id: postId, thumbnailUrl: thumbSrc, tags, artist: artistTag || 'Unknown',
       characters: characterTags.map(c => c.replace(/ \(.*\)$/, '')),
       score, rating, title: displayTitle,
       postUrl: `${R34_BASE}${href}`,
+      isVideo: isVideo || undefined,
     });
   }
 
@@ -345,7 +352,26 @@ export async function GET(request: Request) {
         });
       }
       if (meta && meta.stored_pages > 0) {
-        // художник залит, но эта страница глубже заготовленного — честно
+        // Художник залит, но эта страница глубже заготовленного. Октябрь 2026:
+        // не «честно пусто», а dapi-догрузка + хвостовое слияние — листание
+        // пользователя само доращивает хранилище (следующие открытия из БД).
+        // dapi дешевле HTML-Jina (~5K токенов за 42 поста против 25K) и
+        // несёт file_url → лайтбокс мгновенный.
+        const dapi = await fetchDapiPage(tags, pid, { jinaAttempts: 1 }).catch(() => null);
+        if (dapi && dapi.via) {
+          if (!dapi.empty && dapi.posts.length > 0) {
+            try { await appendTailPosts(tags, dapi.posts, meta.total_posts); } catch { /* хвост дольётся кроном */ }
+            const payload = { posts: dapi.posts, totalPages: meta.total_pages, totalPosts: meta.total_posts, storedPages: meta.stored_pages };
+            cache.set(cacheKey, payload);
+            stale.set(cacheKey, payload);
+            return NextResponse.json({ posts: dapi.posts, total: payload.totalPosts, page, totalPages: payload.totalPages, tags, storedPages: payload.storedPages });
+          }
+          if (dapi.empty) {
+            // страница за концом тега — источник честно пуст
+            return NextResponse.json({ posts: [], total: meta.total_posts, page, totalPages: meta.total_pages, tags, storedPages: meta.stored_pages });
+          }
+        }
+        // dapi не прошёл — прежнее поведение: честная пустая страница
         return NextResponse.json({
           posts: [], total: meta.total_posts, page,
           totalPages: meta.total_pages, tags, storedPages: meta.stored_pages,

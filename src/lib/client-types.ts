@@ -63,6 +63,8 @@ export interface ParsedPost {
   title: string;
   postUrl: string;
   isVideo?: boolean;
+  /** Полный URL (dapi file_url) — лайтбокс открывается мгновенно, без /api/rule34-post */
+  fullUrl?: string;
 }
 
 export type Page = 'home' | 'catalog' | 'search' | 'watch' | 'favorites' | 'history' | 'profile' | 'hentai' | 'admin';

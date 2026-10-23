@@ -136,6 +136,14 @@ export function HentaiPage({ onOpen, favorites, onNavigate, toggleFav, hasSubscr
     setViewerLoading(true);
     setViewerIsVideo(false);
     setViewerError('');
+    // dapi-синк приносит полный URL прямо в списке (fullUrl) — лайтбокс
+    // открывается мгновенно на ПК и мобильном, без запроса к серверу
+    if (post.fullUrl) {
+      setViewerFullImg(post.fullUrl);
+      setViewerIsVideo(!!post.isVideo);
+      setViewerLoading(false);
+      return;
+    }
     try {
       const d = await apiFetch<{ imageUrl?: string; isVideo?: boolean; tags?: string[]; error?: string; stale?: boolean }>(
         `/api/rule34-post?id=${post.id}&thumb=${encodeURIComponent(post.thumbnailUrl || '')}`

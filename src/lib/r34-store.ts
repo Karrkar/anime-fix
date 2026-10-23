@@ -330,3 +330,181 @@ export function resetStoreCaches(): void {
   metaCache.clear();
   metaCacheTs.clear();
 }
+
+/* ── ИНКРЕМЕНТАЛЬНЫЕ СЛИЯНИЯ (октябрь 2026, ежедневный крон arts-sync) ──
+ *
+ * upsertArtistPosts перечитывает и перезаписывает ВСЕ чанки тега — для
+ * balecxi (33k постов = 79 чанков) это десятки секунд. Для ежедневного
+ * крона:
+ *
+ *   FRESH (новые посты дня) — сам upsertArtistPosts, но по РОТАЦИИ
+ *   (2-3 тега за звено): все 14 обновляются за несколько звеньев цепочки.
+ *
+ *   appendTailPosts — бэкфилл истории (хвост): читает только последний
+ *   чанк и дописывает новые в конец, O(1) к размеру тега. Это главный
+ *   путь «всех ~143k постов»: сотни страниц хвоста без перелива головы. */
+
+async function writeChunkRow(tag: string, chunk: number, posts: ParsedPost[]): Promise<void> {
+  const db = getDb();
+  const { error } = await db.from('sync_status').upsert({
+    source: chunkRowKey(tag, chunk),
+    last_run_at: new Date().toISOString(),
+    last_status: 'ok',
+    new_items: posts.length,
+    updated_items: 0,
+    details: { tag, chunk, posts, saved_at: new Date().toISOString() },
+    error: null,
+  }, { onConflict: 'source' });
+  if (error) throw new Error(`chunk upsert: ${error.message}`);
+  chunkCache.set(`${tag}:c${chunk}`, { posts, fetchedAt: Date.now() });
+}
+
+async function saveMetaRow(meta: R34Meta): Promise<void> {
+  const db = getDb();
+  meta.updated_at = new Date().toISOString();
+  const { error } = await db.from('sync_status').upsert({
+    source: `r34_meta_${meta.tag}`,
+    last_run_at: meta.updated_at,
+    last_status: 'ok',
+    new_items: meta.stored_posts,
+    updated_items: 0,
+    details: meta as unknown as Record<string, unknown>,
+    error: null,
+  }, { onConflict: 'source' });
+  if (error) throw new Error(`meta upsert: ${error.message}`);
+  metaCache.set(meta.tag, meta);
+  metaCacheTs.set(meta.tag, Date.now());
+  metaCacheTs.delete('__all__');
+}
+
+/** Слить два списка постов (дедуп по id, вход b приоритетнее), id desc. */
+function dedupeSort(a: ParsedPost[], b: ParsedPost[]): ParsedPost[] {
+  const byId = new Map<string, ParsedPost>();
+  for (const p of a) if (p && p.id) byId.set(p.id, p);
+  for (const p of b) if (p && p.id) byId.set(p.id, p); // b перекрывает
+  return [...byId.values()].sort((x, y) => Number(y.id) - Number(x.id));
+}
+
+export interface IncrementalResult {
+  tag: string;
+  added: number;         // сколько НОВЫХ постов действительно вошло
+  stored_posts: number;
+  stored_pages: number;
+  complete: boolean;
+}
+
+/** ХВОСТОВОЕ слияние: бэкфилл истории (посты старше хранимых). Читает
+ *  только последний чанк, дописывает новые в конец. O(1) к размеру тега. */
+export async function appendTailPosts(
+  tag: string,
+  batch: ParsedPost[],
+  totalPosts?: number,
+): Promise<IncrementalResult> {
+  const meta = await getMeta(tag);
+  const before = meta?.stored_posts || 0;
+
+  // Последний существующий чанк: по мете, с фолбэком на перебор (защита
+  // от расхождения меты при сбоях)
+  let lastChunk = meta && before > 0 ? Math.max(0, Math.ceil(before / POSTS_PER_CHUNK) - 1) : -1;
+  if (lastChunk >= 0) {
+    const probe = await readChunkRow(tag, lastChunk);
+    if (!probe || probe.length === 0) {
+      for (let c = lastChunk; c >= 0; c--) {
+        const p = await readChunkRow(tag, c);
+        if (p && p.length > 0) { lastChunk = c; break; }
+        if (c === 0) lastChunk = -1;
+      }
+    }
+  }
+
+  let merged: ParsedPost[];
+  if (lastChunk >= 0) {
+    const tail = (await readChunkRow(tag, lastChunk)) || [];
+    merged = dedupeSort(tail, batch);
+  } else {
+    merged = dedupeSort([], batch);
+    lastChunk = 0;
+  }
+
+  // Раскладка: lastChunk (перезапись) + новые чанки до конца
+  const chunksToWrite: Array<[number, ParsedPost[]]> = [];
+  for (let i = 0; i * POSTS_PER_CHUNK < merged.length; i++) {
+    chunksToWrite.push([lastChunk + i, merged.slice(i * POSTS_PER_CHUNK, (i + 1) * POSTS_PER_CHUNK)]);
+  }
+  for (const [c, posts] of chunksToWrite) await writeChunkRow(tag, c, posts);
+
+  const total = totalPosts && totalPosts > 0 ? totalPosts : (meta?.total_posts || merged.length);
+  const stored = Math.max(before, lastChunk * POSTS_PER_CHUNK + merged.length);
+  const newMeta: R34Meta = {
+    tag,
+    total_posts: total,
+    total_pages: Math.max(1, Math.ceil(total / PER_PAGE)),
+    stored_posts: stored,
+    stored_pages: Math.ceil(stored / PER_PAGE),
+    complete: stored >= total,
+    updated_at: '',
+  };
+  await saveMetaRow(newMeta);
+  return {
+    tag,
+    added: Math.max(0, stored - before),
+    stored_posts: stored,
+    stored_pages: newMeta.stored_pages,
+    complete: newMeta.complete,
+  };
+}
+
+/** Публичное чтение чанка (для arts-sync: проверка «все ли посты батча уже
+ *  в c0» без полной переливки). null — чанк ещё не залит. */
+export async function readChunkPublic(tag: string, chunk: number): Promise<ParsedPost[] | null> {
+  return readChunkRow(tag, chunk);
+}
+
+/* ── КЭШ ДЕТАЛОК ПОСТА (лайтбокс, октябрь 2026) ──────────────────────
+ * Файл поста immutable (хеш в URL) — один раз пробингнули/получили полный
+ * URL, навсегда закэшировали в r34_post:<id>. Повторное открытие арта —
+ * один дешёвый roundtrip к sync_status вместо перебора расширений CDN.
+ * Формат details совместим со строками от 03.10 (details.data). */
+
+export interface R34PostDetail {
+  id: string;
+  imageUrl: string;
+  isVideo: boolean;
+  postUrl: string;
+  tags: string[];
+  score: number;
+}
+
+export function postKey(postId: string | number): string {
+  return `r34_post:${postId}`;
+}
+
+export async function loadPostDetail(postId: string): Promise<R34PostDetail | null> {
+  try {
+    const db = getDb();
+    const { data } = await db.from('sync_status').select('details').eq('source', postKey(postId)).maybeSingle();
+    const d = data?.details as { data?: R34PostDetail } | null;
+    if (!d?.data || !d.data.imageUrl) return null;
+    return d.data;
+  } catch {
+    return null;
+  }
+}
+
+export async function savePostDetail(detail: R34PostDetail): Promise<void> {
+  try {
+    const db = getDb();
+    const { error } = await db.from('sync_status').upsert({
+      source: postKey(detail.id),
+      last_run_at: new Date().toISOString(),
+      last_status: 'ok',
+      new_items: 0,
+      updated_items: 0,
+      details: { data: detail, savedAt: new Date().toISOString() } as unknown as Record<string, unknown>,
+      error: null,
+    }, { onConflict: 'source' });
+    if (error) console.error(`savePostDetail(${detail.id}):`, error.message);
+  } catch (e) {
+    console.error(`savePostDetail(${detail.id}) failed:`, e);
+  }
+}

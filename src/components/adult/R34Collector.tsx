@@ -28,6 +28,7 @@ const CREDS_KEY = 'r34_api_credentials';
 interface DapiPost {
   id?: number | string;
   preview_url?: string;
+  file_url?: string;
   tags?: string;
   score?: number;
   rating?: string;
@@ -43,6 +44,8 @@ interface ParsedPost {
   rating: string;
   title: string;
   postUrl: string;
+  isVideo?: boolean;
+  fullUrl?: string;
 }
 
 function dapiToParsed(posts: DapiPost[], artistTag: string): ParsedPost[] {
@@ -75,6 +78,10 @@ function dapiToParsed(posts: DapiPost[], artistTag: string): ParsedPost[] {
       rating: typeof p.rating === 'string' ? p.rating : 'explicit',
       title: displayTitle,
       postUrl: `https://rule34.xxx/index.php?page=post&s=view&id=${id}`,
+      // file_url: мгновенный лайтбокс (без /api/rule34-post) + видео-детект
+      ...(typeof p.file_url === 'string' && /^https?:\/\/[a-z0-9.-]+\.rule34\.xxx\//i.test(p.file_url)
+        ? { fullUrl: p.file_url, isVideo: /\.(mp4|webm)(?:\?|$)/i.test(p.file_url) || tags.some(t => t.toLowerCase() === 'animated') }
+        : {}),
     });
   }
   return out;

@@ -86,6 +86,10 @@
     {
       "path": "/api/r34-sync",
       "schedule": "40 4 * * *"
+    },
+    {
+      "path": "/api/arts-sync?fresh=2&deep=6&chain=1&hops=6",
+      "schedule": "0 5 * * *"
     }
   ]
 }
