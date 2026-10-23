@@ -54,23 +54,40 @@ async function fetchCount(tag) {
   } catch { return 0; }
 }
 
+async function sbReadChunks(tag) {
+  // все чанки художника (для merge: заливщик не должен затирать данные,
+  // которые мог добавить клиентский сборщик через /api/r34-ingest)
+  const out = [];
+  for (let c = 0; c < 500; c++) {
+    const r = await fetch(`${SB_URL}/rest/v1/sync_status?source=eq.r34_store_${tag}_c${c}&select=details`, {
+      headers: { apikey: SB_KEY, Authorization: `Bearer ${SB_KEY}` },
+      signal: AbortSignal.timeout(60000),
+    });
+    if (!r.ok) break;
+    const rows = await r.json();
+    if (!rows.length || !rows[0].details || !Array.isArray(rows[0].details.posts)) break;
+    out.push(...rows[0].details.posts);
+  }
+  return out;
+}
+
 const wanted = process.argv.slice(2).length ? process.argv.slice(2) : TAGS;
 
 for (const tag of wanted) {
   const ndjson = path.join(DATA_DIR, `${tag}.ndjson`);
   if (!fs.existsSync(ndjson)) { console.log(`${tag}: нет ${ndjson} — пропуск`); continue; }
   const lines = fs.readFileSync(ndjson, 'utf8').split('\n').filter(Boolean);
-  const seen = new Set();
-  const posts = [];
+  const byId = new Map();
   for (const line of lines) {
     try {
       const p = JSON.parse(line);
-      if (p.id && !seen.has(p.id) && typeof p.thumbnailUrl === 'string') {
-        seen.add(p.id);
-        posts.push(p);
-      }
+      if (p.id && typeof p.thumbnailUrl === 'string') byId.set(p.id, p);
     } catch { /* битая строка — мимо */ }
   }
+  // merge с уже хранимым: локальные скрейп-данные перекрывают (одинаковы по сути)
+  const existing = await sbReadChunks(tag);
+  for (const p of existing) if (!byId.has(p.id)) byId.set(p.id, p);
+  const posts = [...byId.values()].sort((a, b) => Number(b.id) - Number(a.id));
   const count = await fetchCount(tag);
   const now = new Date().toISOString();
 

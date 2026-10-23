@@ -192,10 +192,24 @@ export interface UpsertResult {
   complete: boolean;
 }
 
+/** Все посты художника из чанков (для merge при инжесте). */
+async function readAllStoredPosts(tag: string): Promise<ParsedPost[]> {
+  const out: ParsedPost[] = [];
+  for (let c = 0; c < 500; c++) {
+    const posts = await readChunkRow(tag, c);
+    if (!posts || posts.length === 0) break;
+    out.push(...posts);
+  }
+  return out;
+}
+
 /**
- * Заливает ПОЛНЫЙ упорядоченный список постов художника (по страницам,
- * от новых к старым, 42 на страницу). Чанки пересобираются целиком —
- * идемпотентно, можно вызывать повторно при догоне.
+ * MERGE-заливка постов художника.
+ *
+ * Вход НЕ обязан быть полным списком: новая партия объединяется с уже
+ * хранимыми (дедуп по id, вход свежее), итог сортируется по id по убыванию
+ * (порядок списков rule34) и раскладывается по чанкам заново. Инвариант
+ * «новые посты в голове» сохраняется для любого порядка батчей.
  *
  * totalPosts — точный счётчик из autocomplete (если 0 — берём длину списка).
  */
@@ -206,17 +220,25 @@ export async function upsertArtistPosts(
 ): Promise<UpsertResult> {
   const db = getDb();
 
-  // дедуп по id с сохранением порядка
-  const seen = new Set<string>();
-  const unique: ParsedPost[] = [];
+  // валидные входные посты
+  const incoming: ParsedPost[] = [];
+  const seenIncoming = new Set<string>();
   for (const p of posts) {
-    if (p && p.id && !seen.has(p.id) && typeof p.thumbnailUrl === 'string') {
-      seen.add(p.id);
-      unique.push(p);
+    if (p && p.id && !seenIncoming.has(p.id) && typeof p.thumbnailUrl === 'string') {
+      seenIncoming.add(p.id);
+      incoming.push(p);
     }
   }
+  if (incoming.length === 0) throw new Error('no valid posts in batch');
 
-  const chunkCount = Math.ceil(unique.length / POSTS_PER_CHUNK) || 1;
+  // существующие + вход: вход перекрывает (свежее)
+  const existing = await readAllStoredPosts(tag);
+  const byId = new Map<string, ParsedPost>();
+  for (const p of existing) byId.set(p.id, p);
+  for (const p of incoming) byId.set(p.id, p);
+  const unique = [...byId.values()].sort((a, b) => Number(b.id) - Number(a.id));
+
+  const chunkCount = Math.max(1, Math.ceil(unique.length / POSTS_PER_CHUNK));
   for (let c = 0; c < chunkCount; c++) {
     const chunkPosts = unique.slice(c * POSTS_PER_CHUNK, (c + 1) * POSTS_PER_CHUNK);
     const row = {
@@ -230,11 +252,19 @@ export async function upsertArtistPosts(
     };
     const { error } = await db.from('sync_status').upsert(row, { onConflict: 'source' });
     if (error) throw new Error(`chunk upsert: ${error.message}`);
-    // чанк мог стать короче (догон) — чистим кэш
     chunkCache.delete(`${tag}:c${c}`);
   }
 
-  const total = totalPosts && totalPosts > 0 ? totalPosts : unique.length;
+  // хвост лишних чанков (если список стал короче) — удалить
+  const oldChunkCount = Math.max(1, Math.ceil(existing.length / POSTS_PER_CHUNK));
+  for (let c = chunkCount; c < oldChunkCount; c++) {
+    try {
+      await db.from('sync_status').delete().eq('source', chunkRowKey(tag, c));
+    } catch { /* не критично */ }
+    chunkCache.delete(`${tag}:c${c}`);
+  }
+
+  const total = totalPosts && totalPosts > 0 ? totalPosts : Math.max(unique.length, existing.length);
   const totalPages = Math.max(1, Math.ceil(total / PER_PAGE));
   const storedPages = Math.ceil(unique.length / PER_PAGE);
   const meta: R34Meta = {
