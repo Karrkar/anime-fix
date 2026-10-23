@@ -159,23 +159,52 @@ export interface DapiFetchOpts {
   timeoutMs?: number;
   /** Пропустить прямой запрос (уже знаем, что egress под баном). */
   skipDirect?: boolean;
+  /** Постов за запрос (42 = страница грида; с ключом API до 1000). */
+  limit?: number;
 }
 
 export interface DapiResult {
   posts: ParsedPost[];
   /** Честная пустота (тег исчерпан / нет постов) — не ошибка. */
   empty: boolean;
-  /** Какой транспорт сработал: 'direct' | 'jina' | null (никакой). */
-  via: 'direct' | 'jina' | null;
+  /** Какой транспорт сработал: 'key-api' | 'direct' | 'jina' | null. */
+  via: 'key-api' | 'direct' | 'jina' | null;
 }
 
-/** Страница списка тега через dapi. null-результат невозможен: отказ всех
- *  транспортов = { posts: [], empty: false, via: null } — вызывающий код
- *  решает, фолбэкнуть ли на HTML-парсер. */
+/** Страница списка тега через dapi. Приоритет: официальный api.rule34.xxx
+ *  с env-ключом (без CF, limit до 1000, бесплатно) → прямой запрос к
+ *  главному хосту (часть egress-IP проходит CF) → Jina Reader.
+ *  null-результат невозможен: отказ всех транспортов = { posts: [], empty:
+ *  false, via: null }. */
 export async function fetchDapiPage(tag: string, pid: number, opts: DapiFetchOpts = {}): Promise<DapiResult> {
   const timeoutMs = opts.timeoutMs ?? 12_000;
   const jinaAttempts = Math.max(0, Math.min(opts.jinaAttempts ?? 1, 3));
-  const url = dapiListUrl(tag, pid, 42);
+  const limit = Math.max(1, Math.min(opts.limit ?? 42, 1000));
+  const url = dapiListUrl(tag, pid, limit);
+
+  // 0) Официальный путь: api.rule34.xxx с ключом пользователя (бесплатный
+  //    ключ rule34: аккаунт → account options → API key; env R34_USER_ID +
+  //    R34_API_KEY). Отдельный хост без CF-челленджа — единственный путь,
+  //    который тянет ПОЛНУЮ историю (1000 постов/запрос) с сервера.
+  const apiKey = process.env.R34_API_KEY?.trim();
+  const userId = process.env.R34_USER_ID?.trim();
+  if (apiKey && userId) {
+    try {
+      const keyUrl = `https://api.rule34.xxx/index.php?page=dapi&s=post&q=index&json=1&limit=${limit}&pid=${pid}&tags=${encodeURIComponent(tag)}&user_id=${encodeURIComponent(userId)}&api_key=${encodeURIComponent(apiKey)}`;
+      const r = await fetch(keyUrl, {
+        headers: { 'User-Agent': UA, Accept: 'application/json' },
+        signal: AbortSignal.timeout(timeoutMs),
+      });
+      if (r.ok) {
+        const text = await r.text();
+        const posts = parseDapiJson(text);
+        if (posts) {
+          return { posts: posts.map(p => mapDapiPost(p, tag)).filter((p): p is ParsedPost => p !== null), empty: posts.length === 0, via: 'key-api' };
+        }
+      }
+      // 401/403 = ключ неверный/отозван — тихо падаем на обычную цепочку
+    } catch { /* сеть — на обычную цепочку */ }
+  }
 
   if (!opts.skipDirect) {
     try {
@@ -199,7 +228,6 @@ export async function fetchDapiPage(tag: string, pid: number, opts: DapiFetchOpt
 /** Деталка одного поста через dapi (id=...) — полный URL без рендера страницы. */
 export async function fetchDapiPostById(postId: string, opts: DapiFetchOpts = {}): Promise<R34PostDetail | null> {
   const timeoutMs = opts.timeoutMs ?? 12_000;
-  const url = `${R34_BASE}/index.php?page=dapi&s=post&q=index&json=1&id=${encodeURIComponent(postId)}`;
 
   const fromDapi = (posts: DapiPost[]): R34PostDetail | null => {
     const p = posts.find(x => String(x.id) === String(postId));
@@ -215,6 +243,24 @@ export async function fetchDapiPostById(postId: string, opts: DapiFetchOpts = {}
       score: Number(p.score) || 0,
     };
   };
+
+  // Официальный api.rule34.xxx с ключом — самый быстрый путь
+  const apiKey = process.env.R34_API_KEY?.trim();
+  const userId = process.env.R34_USER_ID?.trim();
+  if (apiKey && userId) {
+    try {
+      const r = await fetch(`https://api.rule34.xxx/index.php?page=dapi&s=post&q=index&json=1&id=${encodeURIComponent(postId)}&user_id=${encodeURIComponent(userId)}&api_key=${encodeURIComponent(apiKey)}`, {
+        headers: { 'User-Agent': UA, Accept: 'application/json' },
+        signal: AbortSignal.timeout(timeoutMs),
+      });
+      if (r.ok) {
+        const posts = parseDapiJson(await r.text());
+        if (posts) return fromDapi(posts);
+      }
+    } catch { /* на обычную цепочку */ }
+  }
+
+  const url = `${R34_BASE}/index.php?page=dapi&s=post&q=index&json=1&id=${encodeURIComponent(postId)}`;
 
   if (!opts.skipDirect) {
     try {

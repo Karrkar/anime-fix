@@ -133,12 +133,14 @@ async function artsSyncHandler(request: NextRequest) {
 
   let jinaSpent = 0;
   const reports: TagReport[] = [];
+  const hasKey = !!(process.env.R34_API_KEY?.trim() && process.env.R34_USER_ID?.trim());
 
-  /** Одна dapi-страница тега (42 поста, direct → Jina). null = отказ. */
-  const page = async (tag: string, pid: number): Promise<{ posts: ParsedPost[]; empty: boolean } | null> => {
-    const dapi = await fetchDapiPage(tag, pid, { jinaAttempts: 1 });
+  /** Одна dapi-страница тега. С ключом — 1000 постов/запрос (api.rule34.xxx,
+   *  без CF/Jina); без ключа — 42 (direct → Jina). null = отказ. */
+  const page = async (tag: string, pid: number, limit = 42): Promise<{ posts: ParsedPost[]; empty: boolean; via: string } | null> => {
+    const dapi = await fetchDapiPage(tag, pid, { jinaAttempts: 1, limit });
     if (dapi.via === 'jina') jinaSpent++;
-    if (dapi.via) return { posts: dapi.posts, empty: dapi.empty };
+    if (dapi.via) return { posts: dapi.posts, empty: dapi.empty, via: dapi.via };
     return null;
   };
 
@@ -157,7 +159,7 @@ async function artsSyncHandler(request: NextRequest) {
       for (const pid of [0, PER_PAGE]) {
         const res = await page(tag, pid);
         if (!res) break;
-        if (via === '') via = 'dapi';
+        if (via === '') via = res.via;
         if (res.empty) break;
         batch.push(...res.posts);
       }
@@ -193,7 +195,7 @@ async function artsSyncHandler(request: NextRequest) {
   let deepIdx = deepStart;
   let deepDone = 0;
   outer:
-  for (let step = 0; step < R34_ARTISTS.length && deepDone < (tagParam ? R34_ARTISTS.length : 4); step++) {
+  for (let step = 0; step < R34_ARTISTS.length && deepDone < (tagParam ? R34_ARTISTS.length : (hasKey ? 10 : 4)); step++) {
     if (Date.now() - t0 > SEGMENT_BUDGET_MS || jinaSpent >= jinaBudget) break;
     const tag = R34_ARTISTS[(deepStart + step) % R34_ARTISTS.length];
     deepIdx = (deepStart + step) % R34_ARTISTS.length;
@@ -207,13 +209,17 @@ async function artsSyncHandler(request: NextRequest) {
 
       const batch: ParsedPost[] = [];
       let empty = false;
-      for (let p = 0; p < deepPages; p++) {
-        if (Date.now() - t0 > SEGMENT_BUDGET_MS || jinaSpent >= jinaBudget) break;
-        const res = await page(tag, meta.stored_posts + p * PER_PAGE);
+      // С ключом — ОДИН запрос на 1000 постов за итерацию (полный бэкфилл
+      // 143k за ~143 запроса); без ключа — deepPages × 42 поста
+      const iterations = hasKey ? 1 : deepPages;
+      const stepLimit = hasKey ? 1000 : PER_PAGE;
+      for (let p = 0; p < iterations; p++) {
+        if (Date.now() - t0 > SEGMENT_BUDGET_MS || (!hasKey && jinaSpent >= jinaBudget)) break;
+        const res = await page(tag, meta.stored_posts + batch.length, stepLimit);
         if (!res) break; // транспорт отказал — тег продолжится в следующем звене
         if (res.empty) { empty = true; break; } // докопали до дна
         batch.push(...res.posts);
-        if (res.posts.length < PER_PAGE) break; // короткая страница = конец списка
+        if (res.posts.length < stepLimit) break; // короткая страница = конец списка
       }
 
       if (batch.length > 0) {
