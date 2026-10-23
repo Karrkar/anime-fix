@@ -39,7 +39,11 @@ if (ins.status !== 201) { console.error('сессия не создана:', ins
 const COOKIE = `anime_age_confirmed=1; anime_platform_token=${token}`;
 
 try {
-  for (const q of [`tags=${TAG}&pid=0`, `tags=all&pid=0`, `tags=${TAG}&pid=420`]) {
+  // argv[3] — произвольный pid (глубокая страница), иначе стандартный набор
+  const queries = process.argv[3]
+    ? [`tags=${TAG}&pid=${process.argv[3]}`]
+    : [`tags=${TAG}&pid=0`, `tags=all&pid=0`, `tags=${TAG}&pid=420`];
+  for (const q of queries) {
     const r = await retryFetch(`${BASE}/api/rule34?${q}`, { headers: { cookie: COOKIE } });
     const ct = r.headers.get('x-data-stale') ? ' (STALE)' : '';
     if (!r.ok) {
