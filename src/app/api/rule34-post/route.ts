@@ -1,7 +1,13 @@
-// F-23 fix: убран runtime = 'edge' — Edge Runtime объявлен платформой устаревшим,
-// роут работает на стандартном Node.js-рантайме (API совместимы).
-// 2026-10-03: переход на lib/r34-fetch — ретраи + валидация HTML + опциональный
-// JINA_API_KEY (r.jina.ai блокирует анонимные датацентровые IP ~40-50% запросов)
+// F-23 fix: убран runtime = 'edge' — роут на стандартном Node.js-рантайме.
+//
+// ОКТЯБРЬ 2026 — «ВСЕ АРТЫ»: полный размер БЕЗ Jina.
+// Прежде роут рендерил страницу поста через Jina (18-22с, 25-50K токенов,
+// полный отказ при 402 ключа). Новый основной путь — пробинг расширений на
+// CDN rule34: миниатюра однозначно даёт bucket и hash полного файла
+// (thumbnails/<b>/thumbnail_<hash>.jpg → images/<b>/<hash>.<ext>),
+// перебираем jpg/jpeg/png/gif/webm/mp4, первый не-404 = полный размер.
+// CDN доступен с Vercel напрямую (проверено диагностикой), Jina не нужен.
+// Живой Jina-путь остаётся фолбэком для постов без thumb-параметра.
 import { NextResponse } from 'next/server';
 import { checkAdultAccess } from '@/lib/adult-access'; // 18+ = возраст + подписка
 import { BoundedTTLCache } from '@/lib/cache';
@@ -14,14 +20,11 @@ export const maxDuration = 60;
 const CACHE_TTL = 30 * 60_000;
 
 // F-20 fix: кэш ограничен (LRU + TTL)
-const cache = new BoundedTTLCache<string, { data: Record<string, unknown>; ts: number }>(200, CACHE_TTL);
+const cache = new BoundedTTLCache<string, { data: Record<string, unknown>; ts: number }>(400, CACHE_TTL);
 
-// 2026-10-04 fix «чёрный экран на телефоне»: stale-кэш последнего успешного
-// ответа (24ч). Деталка через Jina занимает 18-22с и может вообще не прийти
-// (лимит/блок) — повторное открытие того же арта не должно снова ждать и
-// падать в пустоту: отдаём последнюю успешную версию (пусть и старую).
-// Клиент при полном провале показывает миниатюру через прокси + «Повторить».
-const stale = new BoundedTTLCache<string, Record<string, unknown>>(600, 24 * 60 * 60_000);
+// stale-кэш последнего успешного ответа (24ч) — повторное открытие арта
+// не ждёт пробинг заново
+const stale = new BoundedTTLCache<string, Record<string, unknown>>(1200, 24 * 60 * 60_000);
 
 // In-memory rate limit (per-IP, 30 req/min)
 const rlBuckets = new Map<string, number[]>();
@@ -42,6 +45,57 @@ function checkRateLimit(ip: string, max = 30, windowMs = 60_000): boolean {
   return true;
 }
 
+const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36';
+
+/** Расширения полного файла в порядке вероятности. */
+const EXTS = ['jpg', 'jpeg', 'png', 'gif', 'webm', 'mp4'] as const;
+const VIDEO_EXTS = new Set(['webm', 'mp4']);
+
+/**
+ * Из URL миниатюры получает кандидатов полного файла.
+ * https://wimg.rule34.xxx/thumbnails/3066/thumbnail_<hash>.jpg?123
+ *   → https://wimg.rule34.xxx/images/3066/<hash>.{jpg,jpeg,png,gif,webm,mp4}
+ * Возвращает null, если миниатюра не распознана.
+ */
+function fullUrlCandidates(thumbUrl: string): string[] {
+  const m = thumbUrl.match(/^https?:\/\/([^/]+)\/thumbnails\/(\d+)\/thumbnail_([a-f0-9]+)\.jpg/i);
+  if (!m) return [];
+  const [, host, bucket, hash] = m;
+  return EXTS.map(ext => `https://${host}/images/${bucket}/${hash}.${ext}`);
+}
+
+interface ProbeResult { imageUrl: string; isVideo: boolean }
+
+/** Перебор расширений на CDN: первый не-404 ответ = полный файл. */
+async function probeFullImage(thumbUrl: string): Promise<ProbeResult | null> {
+  const candidates = fullUrlCandidates(thumbUrl);
+  if (candidates.length === 0) return null;
+  for (const url of candidates) {
+    try {
+      const r = await fetch(url, {
+        headers: {
+          'User-Agent': UA,
+          Referer: `${R34_BASE}/`,
+          Range: 'bytes=0-0', // 1 байт: нужен только статус
+        },
+        signal: AbortSignal.timeout(8000),
+      });
+      // 404 = файла нет; 403 на этом CDN встречается и у несуществующих
+      // webm/mp4 — не считаем попаданием, но и не прерываем перебор
+      if (r.status === 200 || r.status === 206) {
+        // тело не нужно — отдаём поток на удаление
+        try { await r.body?.cancel(); } catch { /* уже закрыт */ }
+        const isVideo = VIDEO_EXTS.has(url.split('.').pop() || '');
+        return { imageUrl: url, isVideo };
+      }
+      try { await r.body?.cancel(); } catch { /* уже закрыт */ }
+    } catch {
+      // таймаут кандидата — пробуем следующее расширение
+    }
+  }
+  return null;
+}
+
 export async function GET(request: Request) {
   // F-15 fix + 18+ по подписке: серверный гейт — возраст И активная подписка
   const access = await checkAdultAccess(request, '/api/rule34-post');
@@ -60,22 +114,44 @@ export async function GET(request: Request) {
   if (!postId || !/^\d+$/.test(postId)) {
     return NextResponse.json({ error: 'Missing or invalid id' }, { status: 400 });
   }
+  // 2026-10-23: клиент передаёт миниатюру — она однозначно определяет
+  // полный файл (bucket+hash), рендерить страницу поста не нужно
+  const thumb = searchParams.get('thumb') || '';
 
   const cached = cache.get(postId);
   if (cached) {
     return NextResponse.json(cached.data);
   }
 
+  /* ── Основной путь: пробинг расширений на CDN ───────────────────── */
+  if (thumb) {
+    try {
+      const probe = await probeFullImage(thumb);
+      if (probe) {
+        const data: Record<string, unknown> = {
+          id: postId,
+          imageUrl: probe.imageUrl,
+          isVideo: probe.isVideo,
+          postUrl: `${R34_BASE}/index.php?page=post&s=view&id=${postId}`,
+          tags: [], // теги у клиента уже есть из списка — не затираем
+          score: 0,
+        };
+        cache.set(postId, { data, ts: Date.now() });
+        stale.set(postId, data);
+        return NextResponse.json(data);
+      }
+    } catch (e) {
+      logEvent('r34_probe_fail', { id: postId, err: String(e).slice(0, 120) });
+    }
+  }
+
+  /* ── Фолбэк: живой рендер страницы поста (Jina) — как раньше ────── */
   try {
     const targetUrl = `${R34_BASE}/index.php?page=post&s=view&id=${postId}`;
     const html = await fetchSourcePage(targetUrl, {
       validate: isPostPageUsable,
       jinaAttempts: 2,
       tryDirect: true,
-      // 2026-10-03: X-Target-Selector — 25-50K токенов вместо 142K за пост.
-      // НЮАНС: выборка требует полного рендера — пост-страница летит 18-20с
-      // (без селектора 9-10с, но 142K токенов). Таймаут 22с: попытка успевает,
-      // худший случай 2×22+1.5+9 ≈ 55с < maxDuration 60.
       timeoutMs: 22_000,
       targetSelector: R34_POST_SELECTOR,
     });
@@ -97,11 +173,6 @@ export async function GET(request: Request) {
     }
     imageUrl = imageUrl.replace(/(https?:\/\/[^\/]+)\/\//, '$1/');
 
-    // Detect video. 2026-10-03 fix: на страницах постов rule34 крутит рекламу
-    // с собственными <video src="…bkcdn.net/….mp4"> — старый код считал их
-    // видео поста и ЗАТИРАЛ правильный imageUrl рекламным URL. Теперь видео
-    // поста = mp4/webm с домена rule34.xxx (ahrimp4/wimg) ИЛИ mp4/webm в
-    // ссылке «Original image» (у видео-постов она указывает на сам файл).
     const isRule34Media = (u: string): boolean => {
       try {
         return new URL(u).hostname.endsWith('rule34.xxx');
@@ -117,7 +188,6 @@ export async function GET(request: Request) {
       !!realVideoUrl || (imageUrl !== '' && /\.(?:mp4|webm)(?:\?|$)/i.test(imageUrl));
     if (realVideoUrl) imageUrl = realVideoUrl;
 
-    // Extract tags
     const tags: string[] = [];
     const tagSidebar = html.match(/<ul id="tag-sidebar">([\s\S]*?)<\/ul>/);
     if (tagSidebar) {

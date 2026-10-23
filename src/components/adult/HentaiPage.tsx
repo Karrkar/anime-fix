@@ -8,6 +8,7 @@ import { LilithChat } from '@/app/chat-widget';
 import { ArtViewerImage, HentaiCard } from '@/components/adult/AdultCards';
 import { AgeGate } from '@/components/adult/AgeGate';
 import { CreativeTab } from '@/components/adult/CreativeTab';
+import { R34Collector } from '@/components/adult/R34Collector';
 import { ADULT_VERIFY_KEY, isVerificationValid } from '@/components/adult/adult-verify';
 import { Rule34ArtCard } from '@/components/cards/ArtCards';
 import { SkeletonGrid } from '@/components/ui';
@@ -82,14 +83,16 @@ export function HentaiPage({ onOpen, favorites, onNavigate, toggleFav, hasSubscr
       const d = await apiFetch<{ posts: ParsedPost[]; total: number; page: number; totalPages: number; error?: string }>(
         `/api/rule34?tags=${encodeURIComponent(t)}&pid=${pid}`
       );
-      if ((d.error || d.posts.length === 0) && !_isRetry) {
+      // Пустая страница без error — валидный ответ хранилища (страница глубже
+      // залитой глубины или честно пустой тег): не ретраим и не пугаем ошибкой
+      if (d.error && !_isRetry) {
         // один авто-ретрай через 1.5с: запрос попадёт на другой инстанс Vercel —
         // у него другой egress-IP, и блок Jina «bad IP reputation» часто обходит
         setArtsRetryHint(true);
         await new Promise(r => setTimeout(r, 1500));
         return loadArts(t, p, true);
       }
-      if (d.error || d.posts.length === 0) {
+      if (d.error) {
         setArtsError('Не удалось загрузить арты');
         setArts([]);
         setArtsRaw([]);
@@ -135,7 +138,7 @@ export function HentaiPage({ onOpen, favorites, onNavigate, toggleFav, hasSubscr
     setViewerError('');
     try {
       const d = await apiFetch<{ imageUrl?: string; isVideo?: boolean; tags?: string[]; error?: string; stale?: boolean }>(
-        `/api/rule34-post?id=${post.id}`
+        `/api/rule34-post?id=${post.id}&thumb=${encodeURIComponent(post.thumbnailUrl || '')}`
       );
       if (d.imageUrl) {
         setViewerFullImg(d.imageUrl);
@@ -499,6 +502,7 @@ export function HentaiPage({ onOpen, favorites, onNavigate, toggleFav, hasSubscr
           </div>
           {/* Quick filter tags - scrollable on mobile */}
           <div className="flex gap-1.5 overflow-x-auto pb-3 -mx-4 px-4 sm:mx-0 sm:px-0 sm:flex-wrap sm:overflow-visible">
+            <R34Collector onDone={() => loadArts(artsTagsRef.current, 1)} />
             {[{ tag: 'arzagod', label: 'Arzagod' }, { tag: 'balecxi', label: 'Balecxi' }, { tag: 'kaistar', label: 'Kaistar' }, { tag: 'kinkimya', label: 'Kinkimya' }, { tag: 'rognezart', label: 'Rognezart' }, { tag: 'hypet', label: 'Hypet' }, { tag: 'backdoorsenpai', label: 'Backdoorsenpai' }, { tag: 'milfhunter228', label: 'Milfhunter228' }, { tag: 'futarush', label: 'Futarush' }, { tag: 'kiraamane', label: 'Kiraamane' }, { tag: 'aliusnext', label: 'Aliusnext' }, { tag: 'meitabuu', label: 'Meitabuu' }, { tag: 'maldo', label: 'Maldo' }, { tag: 'duxvector', label: 'Duxvector' }, { tag: 'all', label: 'Все художники' }].map(t => (
               <button
                 key={t.tag}

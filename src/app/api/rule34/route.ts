@@ -1,16 +1,22 @@
 // F-23 fix: убран runtime = 'edge' — платформа объявила Edge Runtime устаревшим,
 // роут работает на стандартном Node.js-рантайме (API совместимы).
-// 2026-10-03 fix «пропавшие авторы»: r.jina.ai блокирует анонимные запросы
-// с датацентровых IP (~40-50% отказов с Vercel) — арты arzagod/kaistar и др.
-// «пропадали», а частичный агрегат кэшировался как полный. Лечение:
-// fetchSourcePage с ретраями и валидацией HTML (lib/r34-fetch), чанкование
-// агрегата, stale-кэш последнего успеха, честные 502 вместо фейковых «пусто».
+//
+// ОКТЯБРЬ 2026 — «ВСЕ АРТЫ С УКАЗАННЫХ ИСТОЧНИКОВ»:
+// Прежде роут был живым прокси rule34.xxx через Jina (42 поста/просмотр,
+// полный от казов при 402 ключа/403 анонима). Теперь основной путь —
+// хранилище БД (lib/r34-store): все ~143k постов 14 художников, страница
+// из БД за миллисекунды. Живой Jina-прокси остаётся фолбэком для тегов,
+// которых нет в хранилище (custom-поиск), и до тех пор, пока хранилище
+// наполняется.
 import { NextResponse } from 'next/server';
 import { checkAdultAccess } from '@/lib/adult-access'; // 18+ = возраст + подписка
 import { BoundedTTLCache } from '@/lib/cache';
 import { logEvent } from '@/lib/logger';
 import { R34_BASE } from '@/lib/sources'; // F-27: домены из единого реестра
 import { fetchSourcePage, isListPageUsable, R34_LIST_SELECTOR, sleep } from '@/lib/r34-fetch';
+import {
+  getStoredPage, getStoredAggregatePage, getMeta, R34_ARTISTS,
+} from '@/lib/r34-store';
 
 export const maxDuration = 60;
 
@@ -28,20 +34,20 @@ interface ParsedPost {
 
 const PER_PAGE = 42;
 
-// 2026-10-01: +6 авторов (futarush, kiraamane, aliusnext, meitabuu, maldo, duxvector)
-const ARTIST_TAGS = ['arzagod', 'balecxi', 'kaistar', 'kinkimya', 'rognezart', 'hypet', 'backdoorsenpai', 'milfhunter228', 'futarush', 'kiraamane', 'aliusnext', 'meitabuu', 'maldo', 'duxvector'];
+// Живой путь (фолбэк): те же теги художников, что и в хранилище
+const ARTIST_TAGS = [...R34_ARTISTS];
 
 // 15 минут: контент rule34 меняется медленно, а каждый лишний запрос к Jina
 // (анонимный датацентровый IP) — риск 401-блока «bad IP reputation»
 const CACHE_TTL = 15 * 60_000;
 
 // F-20 fix: кэш ограничен (LRU + TTL) — раньше Map рос без границ в edge-инстансе
-const cache = new BoundedTTLCache<string, { posts: ParsedPost[]; totalPages: number; totalPosts: number }>(100, CACHE_TTL);
+const cache = new BoundedTTLCache<string, { posts: ParsedPost[]; totalPages: number; totalPosts: number; storedPages?: number }>(100, CACHE_TTL);
 
 // 2026-10-03: stale-кэш последнего УСПЕШНОГО результата (горизонт 6ч) —
 // страховка от фейков: если источник отказал, отдаём последнее живое,
 // а не молчаливый ноль
-const stale = new BoundedTTLCache<string, { posts: ParsedPost[]; totalPages: number; totalPosts: number }>(400, 6 * 60 * 60_000);
+const stale = new BoundedTTLCache<string, { posts: ParsedPost[]; totalPages: number; totalPosts: number; storedPages?: number }>(400, 6 * 60 * 60_000);
 
 // In-memory rate limit (per-IP, 20 req/min) — работает и на Node-рантайме
 const rlBuckets = new Map<string, number[]>();
@@ -153,10 +159,6 @@ async function fetchAllArtists(pid: number): Promise<ParsedList & { coverage: nu
 
   // 2026-10-03: вместо 14 параллельных запросов (пакет как раз и ловил блок)
   // — чанки по 5 с паузами; отказавший тег добираем из stale-кэша
-  // 2026-10-04: сначала сверяемся с 15-мин кэшем (его греют одиночные
-  // просмотры артистов) — экономия анонимного рейт-лимита Jina (20 RPM);
-  // отказавшие теги добираются ОТЛОЖЕННЫМ ретраем (окно рейт-лимита/блока
-  // стареет), и только потом — stale-кэш
   const CHUNK = 5;
   const failed: string[] = [];
   for (let i = 0; i < ARTIST_TAGS.length; i += CHUNK) {
@@ -250,6 +252,7 @@ export async function GET(request: Request) {
     return NextResponse.json({ error: 'Invalid tags', posts: [], total: 0, page: 1, totalPages: 0, tags }, { status: 400 });
   }
 
+  /* ── ХРАНИЛИЩЕ: агрегат «Все художники» ─────────────────────────── */
   if (tags === 'all' || tags === '') {
     const cacheKey = `all:${pid}`;
     const cached = cache.get(cacheKey);
@@ -257,36 +260,128 @@ export async function GET(request: Request) {
       return NextResponse.json({
         posts: cached.posts, total: cached.totalPosts,
         page, totalPages: cached.totalPages, tags: 'all',
+        storedPages: cached.storedPages,
       });
     }
     try {
-      const fresh = await fetchAllArtists(pid);
-      const st = stale.get(cacheKey);
-      // покрытие ≥75% — кэшируем как полный; хуже — не кэшируем фрагмент,
-      // но отдаём лучший из (фрагмент, stale) вариантов
-      if (fresh.coverage >= 0.75 || !st || st.posts.length <= fresh.posts.length) {
-        if (fresh.coverage >= 0.75) {
-          cache.set(cacheKey, fresh);
-          stale.set(cacheKey, fresh);
-        }
-        if (fresh.posts.length === 0) {
-          return NextResponse.json(
-            { error: 'Source unavailable', detail: `coverage ${fresh.coverage.toFixed(2)}`, posts: [], total: 0, page, totalPages: 0, tags: 'all' },
-            { status: 502 }
-          );
-        }
-        return NextResponse.json({ posts: fresh.posts, total: fresh.totalPosts, page, totalPages: fresh.totalPages, tags: 'all' });
+      const stored = await getStoredAggregatePage(page - 1);
+      if (stored.posts.length > 0) {
+        const payload = {
+          posts: stored.posts, totalPages: stored.totalPages,
+          totalPosts: stored.totalPosts,
+        };
+        cache.set(cacheKey, payload);
+        stale.set(cacheKey, payload);
+        return NextResponse.json({
+          posts: stored.posts, total: stored.totalPosts,
+          page, totalPages: stored.totalPages, tags: 'all',
+        });
       }
-      return NextResponse.json({ posts: st.posts, total: st.totalPosts, page, totalPages: st.totalPages, tags: 'all' });
+      // Хранилище пусто (страница ещё не залита) → живой фолбэк,
+      // а при его отказе — честная мета вместо фейкового нуля
+      try {
+        const fresh = await fetchAllArtists(pid);
+        if (fresh.posts.length > 0) {
+          const st = stale.get(cacheKey);
+          if (fresh.coverage >= 0.75 || !st || st.posts.length <= fresh.posts.length) {
+            if (fresh.coverage >= 0.75) {
+              cache.set(cacheKey, fresh);
+              stale.set(cacheKey, fresh);
+            }
+            return NextResponse.json({ posts: fresh.posts, total: fresh.totalPosts, page, totalPages: fresh.totalPages, tags: 'all' });
+          }
+          return NextResponse.json({ posts: st.posts, total: st.totalPosts, page, totalPages: st.totalPages, tags: 'all' });
+        }
+      } catch {
+        // живой путь мёртв (Jina 402/403) — идём в мета-ответ ниже
+      }
+      if (stored.totalPosts > 0) {
+        // мета есть, но эта глубина ещё не залита — честная пустая страница
+        return NextResponse.json({ posts: [], total: stored.totalPosts, page, totalPages: stored.totalPages, tags: 'all' });
+      }
+      const st = stale.get(cacheKey);
+      if (st) {
+        return NextResponse.json({ posts: st.posts, total: st.totalPosts, page, totalPages: st.totalPages, tags: 'all' }, { headers: { 'X-Data-Stale': '1' } });
+      }
+      return NextResponse.json({ error: 'Source unavailable', detail: 'store empty, live chain down', posts: [], total: 0, page, totalPages: 0, tags: 'all' }, { status: 502 });
     } catch (e) {
       const st = stale.get(cacheKey);
       if (st) {
         return NextResponse.json({ posts: st.posts, total: st.totalPosts, page, totalPages: st.totalPages, tags: 'all' }, { headers: { 'X-Data-Stale': '1' } });
       }
-      return NextResponse.json({ error: 'Source unavailable', detail: String(e).slice(0, 140), posts: [], total: 0, page, totalPages: 0, tags: 'all' }, { status: 502 });
+      return NextResponse.json({ error: 'Store read failed', detail: String(e).slice(0, 140), posts: [], total: 0, page, totalPages: 0, tags: 'all' }, { status: 502 });
     }
   }
 
+  /* ── ХРАНИЛИЩЕ: конкретный художник из списка источников ────────── */
+  const isArtist = (ARTIST_TAGS as string[]).includes(tags);
+  if (isArtist) {
+    const cacheKey = `${tags}:${pid}`;
+    const cached = cache.get(cacheKey);
+    if (cached) {
+      return NextResponse.json({
+        posts: cached.posts, total: cached.totalPosts,
+        page, totalPages: cached.totalPages, tags, storedPages: cached.storedPages,
+      });
+    }
+    try {
+      const [storedPosts, meta] = await Promise.all([
+        getStoredPage(tags, page - 1),
+        getMeta(tags),
+      ]);
+      if (storedPosts && storedPosts.length > 0) {
+        const payload = {
+          posts: storedPosts,
+          totalPages: meta?.total_pages || Math.ceil(storedPosts.length / PER_PAGE),
+          totalPosts: meta?.total_posts || storedPosts.length,
+          storedPages: meta?.stored_pages,
+        };
+        cache.set(cacheKey, payload);
+        stale.set(cacheKey, payload);
+        return NextResponse.json({
+          posts: storedPosts, total: payload.totalPosts,
+          page, totalPages: payload.totalPages, tags,
+          storedPages: payload.storedPages,
+        });
+      }
+      if (meta && meta.stored_pages > 0) {
+        // художник залит, но эта страница глубже заготовленного — честно
+        return NextResponse.json({
+          posts: [], total: meta.total_posts, page,
+          totalPages: meta.total_pages, tags, storedPages: meta.stored_pages,
+        });
+      }
+      // в хранилище пусто → живой фолбэк ( работает, если Jina оживёт )
+      const live = await fetchListPage(
+        `${R34_BASE}/index.php?page=post&s=list&tags=${encodeURIComponent(tags)}&pid=${pid}`,
+        'full',
+      ).then(({ html, empty }) => (empty ? null : parseListPage(html, tags)))
+        .catch(() => null);
+      if (live && live.posts.length > 0) {
+        cache.set(cacheKey, live);
+        stale.set(cacheKey, live);
+        return NextResponse.json({ posts: live.posts, total: live.totalPosts, page, totalPages: live.totalPages, tags });
+      }
+      const st = stale.get(cacheKey);
+      if (st) {
+        return NextResponse.json({ posts: st.posts, total: st.totalPosts, page, totalPages: st.totalPages, tags }, { headers: { 'X-Data-Stale': '1' } });
+      }
+      return NextResponse.json({
+        error: 'Source unavailable',
+        detail: 'store empty for artist, live chain down',
+        posts: [], total: 0, page, totalPages: 0, tags,
+      }, { status: 502 });
+    } catch (e) {
+      logEvent('r34_store_fail', { tags, pid, err: String(e).slice(0, 120) });
+      const st = stale.get(cacheKey);
+      if (st) {
+        return NextResponse.json({ posts: st.posts, total: st.totalPosts, page, totalPages: st.totalPages, tags }, { headers: { 'X-Data-Stale': '1' } });
+      }
+      return NextResponse.json({ error: 'Store read failed', detail: String(e).slice(0, 140), posts: [], total: 0, page, totalPages: 0, tags }, { status: 502 });
+    }
+  }
+
+  /* ── Прочие теги (custom-поиск) — живой путь как раньше ──────────── */
   const cacheKey = `${tags}:${pid}`;
   const cached = cache.get(cacheKey);
   if (cached) {
