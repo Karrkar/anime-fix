@@ -34,6 +34,26 @@ import { buildChainUrl, fireChainNext } from '@/lib/sync-chain';
 import { upsertArtistPosts, updateMetaCounts, getMeta, getAllMetas, R34_ARTISTS, PER_PAGE } from '@/lib/r34-store';
 
 export const dynamic = 'force-dynamic';
+
+/** Лучший-усилие трассировка звеньев веток (source='r34_links', накапливающий
+ *  массив). Пишется параллельными ветками — гонки допускаются (последний
+ *  апсерт выигрывает); значимые состояния живут в r34_sync и не затираются. */
+const linkTraceEvents: Array<Record<string, unknown>> = [];
+async function traceLink(event: string, extra?: Record<string, unknown>): Promise<void> {
+  linkTraceEvents.push({ event, ...(extra || {}), t: new Date().toISOString() });
+  try {
+    const db = getDb();
+    await db.from('sync_status').upsert({
+      source: 'r34_links',
+      last_run_at: new Date().toISOString(),
+      last_status: 'ok',
+      new_items: 0,
+      updated_items: 0,
+      details: { events: [...linkTraceEvents] },
+      error: null,
+    }, { onConflict: 'source' });
+  } catch { /* диагностика не должна ломать синк */ }
+}
 export const maxDuration = 60;
 
 interface DapiPost {
@@ -198,18 +218,9 @@ export async function GET(request: Request) {
     // бюджета, при нехватке бюджета — продолжение следующим звеном ветки.
     if (idx < R34_ARTISTS.length) {
       const end = Math.min(R34_ARTISTS.length, idx + slice);
-      // Трассировка звена: старт-маркер до работы; завершение художника —
-      // по r34_meta_<tag>, финал — по finished_at, сбой dapi — по error-записи.
-      await recordSyncRun('r34_sync', {
-        status: 'ok',
-        details: {
-          mode: full ? 'full' : 'daily',
-          link: idx,
-          slice: end - idx,
-          tag: R34_ARTISTS[idx],
-          started_at: new Date().toISOString(),
-        },
-      });
+      // Старт-маркер звена — в r34_links (НЕ в r34_sync: параллельные ветки
+      // затирали бы финальную запись друг друга, инцидент 24.10).
+      await traceLink('link_start', { idx, slice: end - idx, tag: R34_ARTISTS[idx], mode: full ? 'full' : 'daily' });
       let storedTotal = 0;
       let lastTag = '';
       let nextIdx = end; // первый необработанный художник (если бюджет кончится)
@@ -253,13 +264,23 @@ export async function GET(request: Request) {
         return NextResponse.json({ ok: true, tag: lastTag, stored: storedTotal, next: nextIdx, slice_left: end - nextIdx, counts });
       }
 
-      // Слайс добит до конца. Последний слайс списка — финальная запись.
+      // Слайс добит до конца. Последний слайс списка — финальная запись
+      // (сестринские ветки в r34_sync больше не пишут — не затрут).
       if (end >= R34_ARTISTS.length) {
+        const cutoff = Date.now() - 10 * 60_000;
+        const metas = await getAllMetas();
+        const fresh = metas.filter(m => Date.parse(m.updated_at) > cutoff).length;
         await recordSyncRun('r34_sync', {
           status: 'ok',
-          details: { mode: full ? 'full' : 'daily', counts, finished_at: new Date().toISOString() },
+          details: {
+            mode: full ? 'full' : 'daily',
+            counts,
+            finished_at: new Date().toISOString(),
+            artists_fresh_10m: fresh,
+            artists_total: R34_ARTISTS.length,
+          },
         });
-        return NextResponse.json({ ok: true, done: true, counts });
+        return NextResponse.json({ ok: true, done: true, artists_fresh_10m: fresh, counts });
       }
       return NextResponse.json({ ok: true, tag: lastTag, stored: storedTotal, counts });
     }
