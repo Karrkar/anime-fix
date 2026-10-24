@@ -20,12 +20,11 @@
  *     заливщик оператора scripts/r34_upload.mjs).
  */
 import { NextResponse } from 'next/server';
-import { after } from 'next/server';
 import { authFromRequest, getDb } from '@/lib/db';
 import { isCronAuthorized } from '@/lib/cron-auth';
 import { logEvent } from '@/lib/logger';
 import { recordSyncRun } from '@/lib/sync-status';
-import { buildChainUrl } from '@/lib/sync-chain';
+import { buildChainUrl, fireChainNext } from '@/lib/sync-chain';
 import { upsertArtistPosts, updateMetaCounts, getMeta, R34_ARTISTS, PER_PAGE } from '@/lib/r34-store';
 
 export const dynamic = 'force-dynamic';
@@ -164,14 +163,14 @@ export async function GET(request: Request) {
       return NextResponse.json({ ok: false, tag, error: String(e).slice(0, 160) }, { status: 502 });
     }
 
-    // следующее звено цепочки — следующий художник
+    // следующее звено цепочки — следующий художник.
+    // fireChainNext (не самодельный after+fetch): UA обязателен — Cloudflare
+    // челленджит безымянные запросы на кастомном домене (инцидент 22.10:
+    // цепочки умирали каждые ~4 звена), таймаутить/прерывать запрос нельзя,
+    // нужны повторы при 403/5xx. Прод-инцидент 24.10: самодельный after с
+    // AbortSignal.timeout(5с) и без UA — цепочка умирала после 1-го звена.
     if (idx + 1 < R34_ARTISTS.length) {
-      const next = buildChainUrl('/api/r34-sync', { full: full ? 1 : undefined, idx: idx + 1 });
-      after(async () => {
-        try {
-          await fetch(next, { headers: { Authorization: `Bearer ${process.env.CRON_SECRET || ''}` }, signal: AbortSignal.timeout(5000) });
-        } catch { /* fire-and-forget: крон добьёт на следующем запуске */ }
-      });
+      fireChainNext(buildChainUrl('/api/r34-sync', { full: full ? 1 : undefined, idx: idx + 1 }));
       return NextResponse.json({ ok: true, tag, stored: collected.length, next: idx + 1, counts });
     }
 
