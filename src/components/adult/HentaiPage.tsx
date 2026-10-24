@@ -16,8 +16,8 @@ import { Anime, ArtItem, Page, ParsedPost } from '@/lib/client-types';
 import { BLUR_DATA_URL, apiFetch, parseGenres } from '@/lib/client-utils';
 
 
-export function HentaiPage({ onOpen, favorites, onNavigate, toggleFav, hasSubscription }: {
-  onOpen: (id: string) => void; favorites: Set<string>; onNavigate: (p: Page) => void; toggleFav: (id: string) => void; hasSubscription: boolean;
+export function HentaiPage({ onOpen, favorites, onNavigate, toggleFav, hasSubscription, isAdmin }: {
+  onOpen: (id: string) => void; favorites: Set<string>; onNavigate: (p: Page) => void; toggleFav: (id: string) => void; hasSubscription: boolean; isAdmin?: boolean;
 }) {
   const [verified, setVerified] = useState(isVerificationValid);
   const [allAnime, setAllAnime] = useState<Anime[]>([]);
@@ -510,7 +510,9 @@ export function HentaiPage({ onOpen, favorites, onNavigate, toggleFav, hasSubscr
           </div>
           {/* Quick filter tags - scrollable on mobile */}
           <div className="flex gap-1.5 overflow-x-auto pb-3 -mx-4 px-4 sm:mx-0 sm:px-0 sm:flex-wrap sm:overflow-visible">
-            <R34Collector onDone={() => loadArts(artsTagsRef.current, 1)} />
+            {/* Инструмент владельца (заливка по API-ключу) — только админу:
+                обычным посетителям не показываем ни панель, ни упоминания rule34 */}
+            {isAdmin && <R34Collector onDone={() => loadArts(artsTagsRef.current, 1)} />}
             {[{ tag: 'arzagod', label: 'Arzagod' }, { tag: 'balecxi', label: 'Balecxi' }, { tag: 'kaistar', label: 'Kaistar' }, { tag: 'kinkimya', label: 'Kinkimya' }, { tag: 'rognezart', label: 'Rognezart' }, { tag: 'hypet', label: 'Hypet' }, { tag: 'backdoorsenpai', label: 'Backdoorsenpai' }, { tag: 'milfhunter228', label: 'Milfhunter228' }, { tag: 'futarush', label: 'Futarush' }, { tag: 'kiraamane', label: 'Kiraamane' }, { tag: 'aliusnext', label: 'Aliusnext' }, { tag: 'meitabuu', label: 'Meitabuu' }, { tag: 'maldo', label: 'Maldo' }, { tag: 'duxvector', label: 'Duxvector' }, { tag: 'all', label: 'Все художники' }].map(t => (
               <button
                 key={t.tag}
@@ -538,15 +540,6 @@ export function HentaiPage({ onOpen, favorites, onNavigate, toggleFav, hasSubscr
                 >
                   Повторить загрузку
                 </button>
-              )}
-              {artsError && (
-                <a
-                  href={`https://rule34.xxx/index.php?page=post&s=list&tags=${encodeURIComponent(artsTags)}`}
-                  target="_blank" rel="noopener noreferrer"
-                  className="inline-block mt-3 text-sm text-pink-400 hover:underline"
-                >
-                  Открыть на rule34.xxx <ExternalLink className="w-3 h-3 inline" />
-                </a>
               )}
             </div>
           ) : (
@@ -625,14 +618,8 @@ export function HentaiPage({ onOpen, favorites, onNavigate, toggleFav, hasSubscr
                   {viewerIndex + 1}/{artsRaw.length}
                 </span>
               </div>
-              <a
-                href={viewerArt.postUrl}
-                target="_blank" rel="noopener noreferrer"
-                className="text-[10px] sm:text-xs text-white/40 hover:text-pink-400 transition-colors flex items-center gap-1 shrink-0 mr-2"
-                onClick={e => e.stopPropagation()}
-              >
-                rule34.xxx <ExternalLink className="w-3 h-3" />
-              </a>
+              {/* Ссылка на источник (rule34) скрыта по требованию владельца:
+                  посетители не должны уходить с сайта — media и так через прокси */}
               <button
                 onClick={closeArtViewer}
                 className="p-1.5 rounded-lg bg-white/10 hover:bg-white/20 text-white transition-colors shrink-0"

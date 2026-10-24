@@ -54,6 +54,9 @@ export default function App({ initialHome }: { initialHome?: HomeInitialData | n
   const [prevPage, setPrevPage] = useState<Page>('home');
   const [moreMenuOpen, setMoreMenuOpen] = useState(false);
   const [hasSubscription, setHasSubscription] = useState(false);
+  // Роль админа отдельно от подписки: ею гейтятся инструменты владельца
+  // (R34Collector во вкладке «Арты») — простым посетителям они не видны
+  const [isAdminUser, setIsAdminUser] = useState(false);
   // Инициализацию роута (чтение URL) выполняем один раз: в dev StrictMode эффект
   // запускается дважды, а replaceState('/') после /?open= вычищает параметр —
   // без флага второй прогон счёл бы hash пустым и сбросил плеер на главную.
@@ -73,6 +76,7 @@ export default function App({ initialHome }: { initialHome?: HomeInitialData | n
     }).then(r => r.json()).then(d => {
       // Admin (role from DB) always has access
       const isAdmin = d.user?.role === 'admin';
+      setIsAdminUser(!!isAdmin);
       if (isAdmin || (d.ok && d.user?.subscription?.isActive)) {
         setHasSubscription(true);
       }
@@ -88,8 +92,8 @@ export default function App({ initialHome }: { initialHome?: HomeInitialData | n
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ action: 'check', ...(savedToken ? { token: savedToken } : {}) }),
       }).then(r => r.json()).then(d => {
-        if (d.user?.role === 'admin') setHasSubscription(true);
-        else setHasSubscription(false);
+        if (d.user?.role === 'admin') { setHasSubscription(true); setIsAdminUser(true); }
+        else { setHasSubscription(false); setIsAdminUser(false); }
       }).catch(() => setHasSubscription(false));
     }
   }, []);
@@ -204,7 +208,7 @@ export default function App({ initialHome }: { initialHome?: HomeInitialData | n
             {page === 'favorites' && <FavoritesPage onOpen={openAnime} favorites={favorites} toggleFav={toggleFav} />}
             {page === 'history' && <HistoryPage onOpen={openAnime} />}
             {page === 'profile' && <ProfilePage onSubscriptionChange={handleSubscriptionChange} onNavigate={navigate} />}
-            {page === 'hentai' && <HentaiPage onOpen={openAnime} favorites={favorites} onNavigate={navigate} toggleFav={toggleFav} hasSubscription={hasSubscription} />}
+            {page === 'hentai' && <HentaiPage onOpen={openAnime} favorites={favorites} onNavigate={navigate} toggleFav={toggleFav} hasSubscription={hasSubscription} isAdmin={isAdminUser} />}
             {page === 'admin' && <AdminPage onBack={() => navigate('profile')} onNavigate={navigate} />}
           </motion.div>
         </AnimatePresence>
