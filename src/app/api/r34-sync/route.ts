@@ -12,12 +12,15 @@
  *     у художника сейчас».
  *  2) Если заданы env R34_USER_ID + R34_API_KEY (бесплатный ключ
  *     rule34.xxx: аккаунт → account options → API key) — тянет посты через
- *     официальный dapi (1000 постов/запрос, JSON) и заливает в хранилище:
- *       ?full=1 — полный обход всех страниц всех художников (самоцепочкой,
- *                 по художателю за звено, 60с на звено);
+ *     официальный dapi (1000 постов/запрос, JSON) и заливает в хранилище.
+ *     Входное звено запускает ВЕТКИ веером (?idx=<старт>&slice=<сколько>
+ *     &chain=1): слайзы [0,4) [4,4) [8,3) [11,3). Ветка батчит художников
+ *     в рамках 45с бюджета и продолжает себя (?idx=...&slice=остаток) при
+ *     нехватке бюджета — но не глубже 4 прыжков: Vercel режет 5-й подряд
+ *     самовызов линии HTTP 508 Loop Detected (инцидент 24.10).
+ *       ?full=1 — все страницы каждого художника (бюджет-capped);
  *       без full — первые 2000 постов каждого (новые посты за сутки).
- *     Звенья самоцепочки идут с chain=1 (без обновления счётчиков — их
- *     обновляет входное звено; экономит ~13с бюджета на каждое звено).
+ *     Звенья веток идут с chain=1: счётчики обновляет только вход (−13с).
  *  3) Без ключа — только счётчики + запись статуса (посты добирает
  *     клиентский сборщик вкладки «Арты» с ключом пользователя, либо
  *     заливщик оператора scripts/r34_upload.mjs).
@@ -126,8 +129,12 @@ export async function GET(request: Request) {
   }
 
   const full = url.searchParams.get('full') === '1';
-  const chained = url.searchParams.get('chain') === '1'; // звено цепочки: Step 1 не нужен
+  const chained = url.searchParams.get('chain') === '1'; // звено ветки: Step 1 не нужен
   const idx = Math.max(0, parseInt(url.searchParams.get('idx') || '0', 10) || 0);
+  // Слайс — сколько художников обрабатывает звено (по умолчанию 1 —
+  // совместимость со старыми вызовами ?idx=N без slice).
+  const sliceRaw = parseInt(url.searchParams.get('slice') || '1', 10);
+  const slice = Math.max(1, Math.min(R34_ARTISTS.length, Number.isFinite(sliceRaw) ? sliceRaw : 1));
   const userId = process.env.R34_USER_ID?.trim() || '';
   const apiKey = process.env.R34_API_KEY?.trim() || '';
   const budget = Date.now() + 45_000; // запас на upsert в maxDuration 60с
@@ -154,62 +161,108 @@ export async function GET(request: Request) {
   }
 
   // ── Шаг 2: dapi-синк постов (если есть ключ) ───────────────────────
-  if (userId && apiKey && idx < R34_ARTISTS.length) {
-    const tag = R34_ARTISTS[idx];
-    // Трассировка звена (инцидент 24.10: цепочка рвалась без следов —
-    // логи рантайма на Hobby недоступны). Старт-маркер пишется ДО работы;
-    // завершение звена видно по r34_meta_<tag>, финал — по finished_at,
-    // сбой dapi — по error-записи. Последний маркер = точка обрыва.
-    await recordSyncRun('r34_sync', {
-      status: 'ok',
-      details: {
-        mode: full ? 'full' : 'daily',
-        link: idx,
-        tag,
-        started_at: new Date().toISOString(),
-      },
-    });
-    const collected: import('@/lib/client-types').ParsedPost[] = [];
-    try {
-      const maxPages = full ? Math.ceil((counts[tag] || 1000) / 1000) : 2;
-      for (let p = 0; p < maxPages; p++) {
-        if (Date.now() > budget) break;
-        const raw = await dapiPage(tag, p, userId, apiKey);
-        const parsed = dapiToParsed(raw, tag);
-        if (parsed.length === 0) break;
-        collected.push(...parsed);
-        if (parsed.length < 1000) break; // дно достигнуто
-        await new Promise(r => setTimeout(r, 400)); // вежливость к API
+  if (userId && apiKey) {
+    // ВХОДНОЕ ЗВЕНО (без chain=1): счётчики уже обновлены выше; само ничего
+    // не синкает — запускает ВЕТКИ веером (слайсы по 3-4 художника).
+    //
+    // Почему веер, а не линейная цепочка 0→1→…→13: Vercel отклоняет 5-й
+    // подряд самовызов одной линии запросов — HTTP 508 Loop Detected за
+    // ~15мс, функция даже не вызывается (инцидент 24.10: три детерминированных
+    // обрыва на переходе 4→5, оба транспорта CF и vercel.app; внешние вызовы
+    // той же URL проходят — значит, счётчик именно ГЛУБИНЫ, не конкуренции).
+    // Вход — глубина 0; каждая ветка стартует с глубины 1 и имеет запас
+    // до 4 прыжков на продолжения по бюджету. Слайзы ≤4 художников: даже при
+    // худшем раскладе (1 художник на звено) ветка укладывается в глубину 4.
+    if (!chained) {
+      const branches: Array<[number, number]> = [[0, 4], [4, 4], [8, 3], [11, 3]]
+        .filter(([bIdx]) => bIdx < R34_ARTISTS.length)
+        .map(([bIdx, bLen]) => [bIdx, Math.min(bLen, R34_ARTISTS.length - bIdx)] as [number, number]);
+      for (const [bIdx, bLen] of branches) {
+        fireChainNext(
+          buildChainUrl('/api/r34-sync', { full: full ? 1 : undefined, idx: bIdx, slice: bLen, chain: 1 }),
+          'r34_chain_trace',
+        );
       }
-      if (collected.length > 0) {
-        const res = await upsertArtistPosts(tag, collected, counts[tag]);
-        logEvent('r34_sync_artist', { tag, stored: res.stored_posts, complete: res.complete });
-      }
-    } catch (e) {
-      logEvent('r34_sync_artist_fail', { tag, err: String(e).slice(0, 140) });
-      await recordSyncRun('r34_sync', { status: 'error', error: String(e).slice(0, 200), details: { tag, idx } });
-      return NextResponse.json({ ok: false, tag, error: String(e).slice(0, 160) }, { status: 502 });
+      await recordSyncRun('r34_sync', {
+        status: 'ok',
+        details: {
+          mode: full ? 'full' : 'daily',
+          fanned_out: branches,
+          started_at: new Date().toISOString(),
+        },
+      });
+      return NextResponse.json({ ok: true, fanned_out: branches, counts });
     }
 
-    // следующее звено цепочки — следующий художник.
-    // fireChainNext (не самодельный after+fetch): UA обязателен — Cloudflare
-    // челленджит безымянные запросы на кастомном домене (инцидент 22.10:
-    // цепочки умирали каждые ~4 звена), таймаутить/прерывать запрос нельзя,
-    // нужны повторы при 403/5xx. Прод-инцидент 24.10: самодельный after с
-    // AbortSignal.timeout(5с) и без UA — цепочка умирала после 1-го звена.
-    if (idx + 1 < R34_ARTISTS.length) {
-      fireChainNext(
-        buildChainUrl('/api/r34-sync', { full: full ? 1 : undefined, idx: idx + 1, chain: 1 }),
-        'r34_chain_trace',
-      );
-      return NextResponse.json({ ok: true, tag, stored: collected.length, next: idx + 1, counts });
-    }
+    // ЗВЕНО ВЕТКИ (chain=1): обработать художников [idx, idx+slice) в рамках
+    // бюджета, при нехватке бюджета — продолжение следующим звеном ветки.
+    if (idx < R34_ARTISTS.length) {
+      const end = Math.min(R34_ARTISTS.length, idx + slice);
+      // Трассировка звена: старт-маркер до работы; завершение художника —
+      // по r34_meta_<tag>, финал — по finished_at, сбой dapi — по error-записи.
+      await recordSyncRun('r34_sync', {
+        status: 'ok',
+        details: {
+          mode: full ? 'full' : 'daily',
+          link: idx,
+          slice: end - idx,
+          tag: R34_ARTISTS[idx],
+          started_at: new Date().toISOString(),
+        },
+      });
+      let storedTotal = 0;
+      let lastTag = '';
+      let nextIdx = end; // первый необработанный художник (если бюджет кончится)
+      for (let i = idx; i < end; i++) {
+        const tag = R34_ARTISTS[i];
+        // Не начинать художника, если до конца бюджета < 20с (dapi 2 стр +
+        // merge могут занять до ~35с; бюджет 45с при maxDuration 60с).
+        if (Date.now() > budget - 20_000) { nextIdx = i; break; }
+        const collected: import('@/lib/client-types').ParsedPost[] = [];
+        try {
+          const maxPages = full ? Math.ceil((counts[tag] || 1000) / 1000) : 2;
+          for (let p = 0; p < maxPages; p++) {
+            if (Date.now() > budget) break;
+            const raw = await dapiPage(tag, p, userId, apiKey);
+            const parsed = dapiToParsed(raw, tag);
+            if (parsed.length === 0) break;
+            collected.push(...parsed);
+            if (parsed.length < 1000) break; // дно достигнуто
+            await new Promise(r => setTimeout(r, 400)); // вежливость к API
+          }
+          if (collected.length > 0) {
+            const res = await upsertArtistPosts(tag, collected, counts[tag]);
+            logEvent('r34_sync_artist', { tag, stored: res.stored_posts, complete: res.complete });
+          }
+          storedTotal += collected.length;
+          lastTag = tag;
+        } catch (e) {
+          logEvent('r34_sync_artist_fail', { tag, err: String(e).slice(0, 140) });
+          await recordSyncRun('r34_sync', { status: 'error', error: String(e).slice(0, 200), details: { tag, idx: i } });
+          return NextResponse.json({ ok: false, tag, error: String(e).slice(0, 160) }, { status: 502 });
+        }
+      }
 
-    await recordSyncRun('r34_sync', {
-      status: 'ok',
-      details: { mode: full ? 'full' : 'daily', counts, finished_at: new Date().toISOString() },
-    });
-    return NextResponse.json({ ok: true, done: true, counts });
+      // Продолжение ветки, если бюджет кончился раньше слайса
+      // (следующее звено той же ветки — глубина +1, запас до 4 прыжков).
+      if (nextIdx < end) {
+        fireChainNext(
+          buildChainUrl('/api/r34-sync', { full: full ? 1 : undefined, idx: nextIdx, slice: end - nextIdx, chain: 1 }),
+          'r34_chain_trace',
+        );
+        return NextResponse.json({ ok: true, tag: lastTag, stored: storedTotal, next: nextIdx, slice_left: end - nextIdx, counts });
+      }
+
+      // Слайс добит до конца. Последний слайс списка — финальная запись.
+      if (end >= R34_ARTISTS.length) {
+        await recordSyncRun('r34_sync', {
+          status: 'ok',
+          details: { mode: full ? 'full' : 'daily', counts, finished_at: new Date().toISOString() },
+        });
+        return NextResponse.json({ ok: true, done: true, counts });
+      }
+      return NextResponse.json({ ok: true, tag: lastTag, stored: storedTotal, counts });
+    }
   }
 
   // ── Без ключа: только счётчики + сводка по хранилищу ───────────────
