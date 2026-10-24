@@ -166,8 +166,10 @@ export function fireChainNext(url: string, traceSource?: string): void {
   // рантайм-логи Hobby недоступны, а молчаливые повторы fire-and-forget
   // скрывали причину). Трассировка не должна ломать цепочку — любой её
   // сбой глотается.
+  const traceEvents: Array<Record<string, unknown>> = [];
   const trace = async (event: string, extra?: Record<string, unknown>): Promise<void> => {
     if (!traceSource) return;
+    traceEvents.push({ event, ...(extra || {}), t: new Date().toISOString() });
     try {
       const db = getDb();
       await db.from('sync_status').upsert({
@@ -176,7 +178,7 @@ export function fireChainNext(url: string, traceSource?: string): void {
         last_status: 'ok',
         new_items: 0,
         updated_items: 0,
-        details: { event, url, ...(extra || {}), t: new Date().toISOString() },
+        details: { url, events: [...traceEvents] },
         error: null,
       }, { onConflict: 'source' });
     } catch { /* тише, тише */ }
