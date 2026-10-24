@@ -6,15 +6,18 @@
  * Авторизация: Vercel Cron (Bearer CRON_SECRET) / ?secret= / админ-сессия.
  *
  * Что делает:
- *  1) ВСЕГДА — обновляет счётчики постов всех 14 художников из публичного
- *     autocomplete api.rule34.xxx (доступен с любого IP, CORS открыт).
- *     В мете появляется честное «сколько постов у художника сейчас».
+ *  1) Входное звено (без chain=1) — обновляет счётчики постов всех 14
+ *     художников из публичного autocomplete api.rule34.xxx (доступен с
+ *     любого IP, CORS открыт). В мете появляется честное «сколько постов
+ *     у художника сейчас».
  *  2) Если заданы env R34_USER_ID + R34_API_KEY (бесплатный ключ
  *     rule34.xxx: аккаунт → account options → API key) — тянет посты через
  *     официальный dapi (1000 постов/запрос, JSON) и заливает в хранилище:
  *       ?full=1 — полный обход всех страниц всех художников (самоцепочкой,
  *                 по художателю за звено, 60с на звено);
  *       без full — первые 2000 постов каждого (новые посты за сутки).
+ *     Звенья самоцепочки идут с chain=1 (без обновления счётчиков — их
+ *     обновляет входное звено; экономит ~13с бюджета на каждое звено).
  *  3) Без ключа — только счётчики + запись статуса (посты добирает
  *     клиентский сборщик вкладки «Арты» с ключом пользователя, либо
  *     заливщик оператора scripts/r34_upload.mjs).
@@ -25,7 +28,7 @@ import { isCronAuthorized } from '@/lib/cron-auth';
 import { logEvent } from '@/lib/logger';
 import { recordSyncRun } from '@/lib/sync-status';
 import { buildChainUrl, fireChainNext } from '@/lib/sync-chain';
-import { upsertArtistPosts, updateMetaCounts, getMeta, R34_ARTISTS, PER_PAGE } from '@/lib/r34-store';
+import { upsertArtistPosts, updateMetaCounts, getMeta, getAllMetas, R34_ARTISTS, PER_PAGE } from '@/lib/r34-store';
 
 export const dynamic = 'force-dynamic';
 export const maxDuration = 60;
@@ -123,18 +126,30 @@ export async function GET(request: Request) {
   }
 
   const full = url.searchParams.get('full') === '1';
+  const chained = url.searchParams.get('chain') === '1'; // звено цепочки: Step 1 не нужен
   const idx = Math.max(0, parseInt(url.searchParams.get('idx') || '0', 10) || 0);
   const userId = process.env.R34_USER_ID?.trim() || '';
   const apiKey = process.env.R34_API_KEY?.trim() || '';
   const budget = Date.now() + 45_000; // запас на upsert в maxDuration 60с
 
-  // ── Шаг 1 (всегда): свежие счётчики всех художников ────────────────
+  // ── Шаг 1: свежие счётчики всех художников ────────────────────────
+  // Входное звено (крон/ручной запуск без chain=1) — 14 запросов
+  // autocomplete + запись мет (~13с). Звенья цепочки (chain=1) счётчики
+  // уже имеют — берут из мет без внешних вызовов (инцидент 24.10:
+  // Step 1 + 2 страницы dapi + merge 80 чанков balecxi не влезали в 60с).
   const counts: Record<string, number> = {};
-  for (const tag of R34_ARTISTS) {
-    const c = await fetchTagCount(tag);
-    if (c > 0) {
-      counts[tag] = c;
-      await updateMetaCounts(tag, c);
+  if (chained) {
+    const metas = await getAllMetas();
+    for (const m of metas) {
+      if (m.total_posts > 0) counts[m.tag] = m.total_posts;
+    }
+  } else {
+    for (const tag of R34_ARTISTS) {
+      const c = await fetchTagCount(tag);
+      if (c > 0) {
+        counts[tag] = c;
+        await updateMetaCounts(tag, c);
+      }
     }
   }
 
@@ -170,7 +185,7 @@ export async function GET(request: Request) {
     // нужны повторы при 403/5xx. Прод-инцидент 24.10: самодельный after с
     // AbortSignal.timeout(5с) и без UA — цепочка умирала после 1-го звена.
     if (idx + 1 < R34_ARTISTS.length) {
-      fireChainNext(buildChainUrl('/api/r34-sync', { full: full ? 1 : undefined, idx: idx + 1 }));
+      fireChainNext(buildChainUrl('/api/r34-sync', { full: full ? 1 : undefined, idx: idx + 1, chain: 1 }));
       return NextResponse.json({ ok: true, tag, stored: collected.length, next: idx + 1, counts });
     }
 

@@ -192,13 +192,34 @@ export interface UpsertResult {
   complete: boolean;
 }
 
-/** Все посты художника из чанков (для merge при инжесте). */
-async function readAllStoredPosts(tag: string): Promise<ParsedPost[]> {
+/** Все посты художника из чанков (для merge при инжесте).
+ *
+ * hintChunks — оценка числа чанков из меты (ceil(stored/POSTS_PER_CHUNK)):
+ * с ней чтение идёт параллельными волнами по 8 (инцидент 24.10: balecxi
+ * 33k постов = 80 чанков читались последовательно ~30-45с → сливы
+ * maxDuration 60с при инжесте из крона). Без подсказки — старый
+ * последовательный проход до первой пустышки.
+ */
+async function readAllStoredPosts(tag: string, hintChunks = 0): Promise<ParsedPost[]> {
   const out: ParsedPost[] = [];
-  for (let c = 0; c < 500; c++) {
-    const posts = await readChunkRow(tag, c);
-    if (!posts || posts.length === 0) break;
-    out.push(...posts);
+  if (hintChunks <= 0) {
+    for (let c = 0; c < 500; c++) {
+      const posts = await readChunkRow(tag, c);
+      if (!posts || posts.length === 0) break;
+      out.push(...posts);
+    }
+    return out;
+  }
+  const lastChunk = Math.min(499, Math.max(0, hintChunks - 1));
+  for (let start = 0; start <= lastChunk; start += 8) {
+    const wave: number[] = [];
+    for (let c = start; c <= Math.min(lastChunk, start + 7); c++) wave.push(c);
+    const rows = await Promise.all(wave.map(c => readChunkRow(tag, c)));
+    let any = false;
+    for (const posts of rows) {
+      if (posts && posts.length > 0) { out.push(...posts); any = true; }
+    }
+    if (!any) break; // мета соврала в большую сторону — дальше пусто
   }
   return out;
 }
@@ -231,15 +252,25 @@ export async function upsertArtistPosts(
   }
   if (incoming.length === 0) throw new Error('no valid posts in batch');
 
-  // существующие + вход: вход перекрывает (свежее)
-  const existing = await readAllStoredPosts(tag);
+  // существующие + вход: вход перекрывает (свежее).
+  // Подсказка о числе чанков — из меты (параллельное чтение волнами).
+  const existingMeta = await getMeta(tag);
+  const existing = await readAllStoredPosts(
+    tag,
+    existingMeta ? Math.ceil(existingMeta.stored_posts / POSTS_PER_CHUNK) : 0,
+  );
   const byId = new Map<string, ParsedPost>();
   for (const p of existing) byId.set(p.id, p);
   for (const p of incoming) byId.set(p.id, p);
   const unique = [...byId.values()].sort((a, b) => Number(b.id) - Number(a.id));
 
   const chunkCount = Math.max(1, Math.ceil(unique.length / POSTS_PER_CHUNK));
-  for (let c = 0; c < chunkCount; c++) {
+  // Запись С ХВОСТА (старшие чанки первыми), параллельными волнами по 8.
+  // При обрыве на середине (maxDuration/сеть) не перезаписанными останутся
+  // ГОЛОВНЫЕ чанки: старые посты в них целы, а недописанные «новые» посты
+  // следующий синк заберёт заново с головы dapi. Обратный порядок (с головы)
+  // терял бы навсегда до 420×N старых постов на стыке (инцидент-анализ 24.10).
+  const writeChunk = async (c: number): Promise<void> => {
     const chunkPosts = unique.slice(c * POSTS_PER_CHUNK, (c + 1) * POSTS_PER_CHUNK);
     const row = {
       source: chunkRowKey(tag, c),
@@ -253,6 +284,11 @@ export async function upsertArtistPosts(
     const { error } = await db.from('sync_status').upsert(row, { onConflict: 'source' });
     if (error) throw new Error(`chunk upsert: ${error.message}`);
     chunkCache.delete(`${tag}:c${c}`);
+  };
+  for (let end = chunkCount - 1; end >= 0; end -= 8) {
+    const wave: number[] = [];
+    for (let c = Math.max(0, end - 7); c <= end; c++) wave.push(c);
+    await Promise.all(wave.map(writeChunk));
   }
 
   // хвост лишних чанков (если список стал короче) — удалить
