@@ -157,9 +157,30 @@ export function fetchTimeBudget(
  * Прерывать/таймаутить нельзя — обрыв на нашей стороне не должен
  * касаться выполняющегося звена.
  */
-export function fireChainNext(url: string): void {
+export function fireChainNext(url: string, traceSource?: string): void {
   if (!url) return;
   const secret = process.env.CRON_SECRET?.trim();
+
+  // Трассировка попыток в sync_status (source передаёт вызывающий роут;
+  // инцидент 24.10: цепочка r34-sync рвалась на 5-м переходе без следов —
+  // рантайм-логи Hobby недоступны, а молчаливые повторы fire-and-forget
+  // скрывали причину). Трассировка не должна ломать цепочку — любой её
+  // сбой глотается.
+  const trace = async (event: string, extra?: Record<string, unknown>): Promise<void> => {
+    if (!traceSource) return;
+    try {
+      const db = getDb();
+      await db.from('sync_status').upsert({
+        source: traceSource,
+        last_run_at: new Date().toISOString(),
+        last_status: 'ok',
+        new_items: 0,
+        updated_items: 0,
+        details: { event, url, ...(extra || {}), t: new Date().toISOString() },
+        error: null,
+      }, { onConflict: 'source' });
+    } catch { /* тише, тише */ }
+  };
 
   // ВАЖНО: колбэк after() ВОЗВРАЩАЕТ промис запроса, а не «void»-ит его.
   // Отсоединённый промис (after(() => void fetch(...))) рантайм считает
@@ -186,14 +207,22 @@ export function fireChainNext(url: string): void {
     if (secret) headers.authorization = `Bearer ${secret}`;
     for (let attempt = 0; attempt < 3; attempt++) {
       try {
+        const t0 = Date.now();
         const r = await fetch(url, { headers, redirect: 'follow' });
         // Заголовки пришли — закрываем тело за собой, не читая
         try { r.body?.cancel(); } catch { /* уже закрыт */ }
-        if (r.ok) return; // звено принято роутом
+        if (r.ok) { // звено принято роутом
+          await trace('ok', { attempt, status: r.status, ms: Date.now() - t0 });
+          return;
+        }
+        await trace(`http_${r.status}`, { attempt, ms: Date.now() - t0 });
         // 403/5xx (CF-челлендж, платформенный сбой) — повтор через 2с
-      } catch { /* сеть — повтор */ }
+      } catch (e) {
+        await trace('fetch_err', { attempt, err: String(e).slice(0, 140) });
+      }
       await new Promise(res => setTimeout(res, 2_000));
     }
+    await trace('gave_up');
     // все попытки не прошли — курсор в sync_status подхватит следующий крон
   };
 

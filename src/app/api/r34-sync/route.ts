@@ -198,7 +198,10 @@ export async function GET(request: Request) {
     // нужны повторы при 403/5xx. Прод-инцидент 24.10: самодельный after с
     // AbortSignal.timeout(5с) и без UA — цепочка умирала после 1-го звена.
     if (idx + 1 < R34_ARTISTS.length) {
-      fireChainNext(buildChainUrl('/api/r34-sync', { full: full ? 1 : undefined, idx: idx + 1, chain: 1 }));
+      fireChainNext(
+        buildChainUrl('/api/r34-sync', { full: full ? 1 : undefined, idx: idx + 1, chain: 1 }),
+        'r34_chain_trace',
+      );
       return NextResponse.json({ ok: true, tag, stored: collected.length, next: idx + 1, counts });
     }
 
