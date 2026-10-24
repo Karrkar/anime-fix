@@ -156,6 +156,19 @@ export async function GET(request: Request) {
   // ── Шаг 2: dapi-синк постов (если есть ключ) ───────────────────────
   if (userId && apiKey && idx < R34_ARTISTS.length) {
     const tag = R34_ARTISTS[idx];
+    // Трассировка звена (инцидент 24.10: цепочка рвалась без следов —
+    // логи рантайма на Hobby недоступны). Старт-маркер пишется ДО работы;
+    // завершение звена видно по r34_meta_<tag>, финал — по finished_at,
+    // сбой dapi — по error-записи. Последний маркер = точка обрыва.
+    await recordSyncRun('r34_sync', {
+      status: 'ok',
+      details: {
+        mode: full ? 'full' : 'daily',
+        link: idx,
+        tag,
+        started_at: new Date().toISOString(),
+      },
+    });
     const collected: import('@/lib/client-types').ParsedPost[] = [];
     try {
       const maxPages = full ? Math.ceil((counts[tag] || 1000) / 1000) : 2;
