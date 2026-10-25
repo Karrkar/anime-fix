@@ -64,6 +64,9 @@ export default function App({ initialHome }: { initialHome?: HomeInitialData | n
 
   // Load favorites on mount (+ считаем «обновления в избранном»)
   useEffect(() => {
+    // Маркер для сторожа самовосстановления в layout.tsx: приложение смонтировалось,
+    // JS-чанки загрузились — чистка кэша с перезагрузкой не требуется.
+    (window as unknown as { __apBoot?: boolean }).__apBoot = true;
     apiFetch<{ favorites: Anime[] }>('/api/favorites').then(d => {
       setFavorites(new Set(d.favorites.map(a => a.id))); // auth: cookie или legacy Bearer
       try { setFavUpdates(computeFavUpdates(d.favorites || [])); } catch { /* ignore */ }

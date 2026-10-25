@@ -10,25 +10,33 @@
  * переводит открытые вкладки под новый SW. Это лечит «замурованную» вкладку
  * со старым HTML/чанками после серии деплоев.
  *
+ * v8 (ap-v8): skipWaiting вынесен из цепочки префетча — в v7 если caches.open()
+ * бросал исключение (приватный режим, квота), skipWaiting НЕ вызывался и новый
+ * SW зависал в waiting навсегда, старый продолжал кормить вкладку мёртвыми
+ * чанками (чёрный экран). Теперь смена активного SW не зависит от кэша вовсе.
+ *
  * Стратегии:
  *  - /_next/static/*, /icons/*, /logo.svg, /favicon.ico → cache-first (неменные хэшируемые ассеты)
  *  - навигация (HTML) → network-first, офлайн-фолбэк на закэшированную «/»
  *  - /api/* → СЕТЬ ТОЛЬКО (никогда не кэшируем: чат, гейты, каталог меняются)
  *  - постеры и прочие картинки → cache-first c лимитом записей
  */
-const CACHE_VERSION = 'ap-v7'; // v7: версионированный URL регистрации — обход кэша Cloudflare
+const CACHE_VERSION = 'ap-v8'; // v8: skipWaiting не зависит от успеха префетша кэша
 const STATIC_CACHE = `${CACHE_VERSION}-static`;
 const IMG_CACHE = `${CACHE_VERSION}-img`;
 const IMG_CACHE_MAX = 120;
 
 self.addEventListener('install', (event) => {
-  // allSettled вместо addAll: апдейт SW обязан встать ЛЮБОЙ ценой — иначе
-  // старая версия не заменится и лечение не сработает. Частичная неудача
-  // префетча оболочки не должна блокировать установку v4.
+  // v8: skipWaiting НЕЗАВИСИМО от префетча — смена SW обязана произойти
+  // любой ценой (раньше сбой caches.open замораживал обновление навсегда).
   event.waitUntil(
-    caches.open(STATIC_CACHE)
-      .then((c) => Promise.allSettled([c.add('/'), c.add('/logo.svg'), c.add('/favicon.ico')]))
-      .then(() => self.skipWaiting())
+    (async () => {
+      self.skipWaiting();
+      try {
+        const c = await caches.open(STATIC_CACHE);
+        await Promise.allSettled([c.add('/'), c.add('/logo.svg'), c.add('/favicon.ico')]);
+      } catch (e) { /* кэш недоступен — не блокируем активацию */ }
+    })()
   );
 });
 

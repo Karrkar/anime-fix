@@ -77,6 +77,34 @@ export default function RootLayout({
       <body
         className={`${geistSans.variable} ${geistMono.variable} antialiased bg-background text-foreground`}
       >
+        {/* СТОРОЖ САМОЛЕЧЕНИЯ (26.10.2026, «чёрный экран после деплоев»): инлайн-скрипт
+            исполняется всегда, даже если JS-чанки сборки не загрузились (404 старых
+            хэшей). Если React-приложение не поставило маркер __apBoot за 9с — вычищаем
+            service worker'ы и кэши и перезагружаем страницу один раз за сессию вкладки.
+            Логин не страдает: httpOnly cookie недоступны из JS и не трогаются. */}
+        <script
+          dangerouslySetInnerHTML={{
+            __html: `(function(){
+              window.__apBoot=false;
+              setTimeout(function(){
+                if(window.__apBoot)return;
+                try{if(sessionStorage.getItem('ap_healed'))return;}catch(e){return;}
+                try{sessionStorage.setItem('ap_healed','1');}catch(e){}
+                try{
+                  navigator.serviceWorker.getRegistrations().then(function(rs){
+                    rs.forEach(function(r){r.unregister();});
+                  });
+                }catch(e){}
+                try{
+                  if(window.caches&&caches.keys){
+                    caches.keys().then(function(ks){ks.forEach(function(k){caches.delete(k);});});
+                  }
+                }catch(e){}
+                setTimeout(function(){location.replace('/?selfheal=1');},600);
+              },9000);
+            })();`,
+          }}
+        />
         {children}
         <PwaRegister />
       </body>
