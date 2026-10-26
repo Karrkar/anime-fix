@@ -24,8 +24,13 @@ export const dynamic = 'force-dynamic';
  * на mp4 (или принимает mp4 напрямую) и отдаёт СОБСТВЕННУЮ страницу с
  * нативным HTML5-<video>:
  *  - страница живёт на нашем origin → frame-src 'self' пропускает её в iframe;
- *  - видео грузится с https:// CDN → media-src 'https:' пропускает поток;
- *  - нативные контролы, перемотка (CDN отдаёт accept-ranges), fullscreen.
+ *  - 2026-10-27 УСКОРЕНИЕ ЗАПУСКА СЕРИЙ: видео раздаётся через наш же
+ *    /api/hb-stream — он тянет каждый чанк с CDN 4 параллельными
+ *    Range-соединениями (CDN режет скорость по соединению: 1 поток ≈ 0.1 МБ/с,
+ *    4 параллельных ≈ 0.8 МБ/с — буфер обгоняет битрейт, запуск за секунды
+ *    вместо минут); preload="auto" — буферизация начинается сразу, не по
+ *    клику «play»;
+ *  - нативные контролы, перемотка, fullscreen.
  *
  * Безопасность (как в остальных adult-маршрутах):
  *  - гейт 18+: возрастная cookie + активная подписка/админ (checkAdultAccess);
@@ -176,6 +181,8 @@ export const GET = withRateLimit(hbPlayerHandler, '/api/hb-player');
 /* ─────────────────── HTML страницы плеера ─────────────────── */
 
 function playerPage(videoUrl: string, posterUrl: string): string {
+  // Видео через наш ускоритель: 4 параллельных соединения к CDN на каждый чанк
+  const streamSrc = `/api/hb-stream?url=${encodeURIComponent(videoUrl)}`;
   return `<!DOCTYPE html>
 <html lang="ru">
 <head>
@@ -199,7 +206,7 @@ function playerPage(videoUrl: string, posterUrl: string): string {
 </head>
 <body>
   <div id="wrap">
-    <video id="v" src="${videoUrl}"${posterUrl ? ` poster="${posterUrl}"` : ''} controls playsinline preload="metadata" controlslist="nodownload"></video>
+    <video id="v" src="${streamSrc}"${posterUrl ? ` poster="${posterUrl}"` : ''} controls playsinline preload="auto" controlslist="nodownload"></video>
     <div id="load"><div class="spin"></div></div>
     <div id="err"><b id="errmsg">Ошибка воспроизведения</b><small>Источник видео недоступен или ссылка устарела</small><button onclick="location.reload()">Обновить</button></div>
   </div>

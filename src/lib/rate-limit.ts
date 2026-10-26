@@ -50,6 +50,9 @@ export const RATE_LIMITS: Record<string, RateLimitConfig> = {
   '/api/history': { windowMs: 60_000, maxRequests: 30 },
   '/api/rule34': { windowMs: 60_000, maxRequests: 20 },
   '/api/search': { windowMs: 60_000, maxRequests: 30 },
+  // Ускоренный стриминг видео 18+ (чанки ~4МБ): одна серия ~240МБ = ~60
+  // чанков, плюс агрессивная первичная буферизация — 180/мин на зрителя
+  '/api/hb-stream': { windowMs: 60_000, maxRequests: 180 },
   '/api/age-confirm': { windowMs: 60_000, maxRequests: 10 },
   '/api/chat': { windowMs: 60_000, maxRequests: 12 }, // чат с Лилит: LLM-вызовы дороги
 }
