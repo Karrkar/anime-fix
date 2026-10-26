@@ -17,12 +17,16 @@
  *      тайтла + хэштеги жанров.
  *   5) Обложка — через оптимизатор нашего домена (/_next/image?w=1080):
  *      гарантированный размер для Instagram и доступность для серверов Meta.
- *   6) Публикует через Instagram Graph API, пишет состояние в rate_limits
- *      (/ig/posted/<vost_id>), шлёт уведомление в Telegram владельцу.
+ *   6) Публикует через Instagram Graph API, затем ДУБЛИРУЕТ тот же пост
+ *      на Facebook-страницу (кросспост для охвата; только с классическим
+ *      FB-токеном — IG-login токен кросспост не поддерживает).
+ *      Пишет состояние в rate_limits (/ig/posted/<vost_id>), шлёт
+ *      уведомление в Telegram владельцу.
  *
  * Требования к аккаунту (без них вернёт configured:false с инструкцией):
- * Instagram Professional (Business/Creator) + привязка к Facebook-странице +
- * токен с instagram_content_publish (см. download/инструкция-instagram.md).
+ * Instagram Professional (Business/Creator) + токен с instagram_content_publish
+ * (см. download/инструкция-instagram.md). Для кросспоста в Facebook нужна
+ * FB-страница + классический токен с pages_manage_posts.
  */
 import { NextRequest, NextResponse } from 'next/server';
 import { getDb, authFromRequest } from '@/lib/db';
@@ -31,6 +35,8 @@ import { logEvent } from '@/lib/logger';
 import { notifyTelegram } from '@/lib/notify';
 import {
   resolveInstagramIdentity,
+  resolveFacebookPage,
+  publishFacebookPhoto,
   refreshInstagramToken,
   publishInstagramImage,
   isTokenError,
@@ -271,17 +277,48 @@ async function instagramAutoHandler(request: NextRequest) {
       caption,
     });
 
+    // ── 5б. Кросспост в Facebook (тот же пост — больше охват) ────────────
+    // Возможен только с классическим FB-токеном (запасной путь инструкции);
+    // IG-login токен кросспост не поддерживает — это штатно, пропускаем.
+    let fbUrl = '';
+    let fbStatus = 'skipped';
+    try {
+      if (identity.tokenKind === 'facebook') {
+        const page = await resolveFacebookPage(token);
+        if (page?.pageToken) {
+          const fbPostId = await publishFacebookPhoto({
+            pageId: page.pageId,
+            pageToken: page.pageToken,
+            imageUrl: cover,
+            caption,
+          });
+          fbUrl = `https://www.facebook.com/${fbPostId}`;
+          fbStatus = 'posted';
+        } else {
+          fbStatus = 'no_page_token';
+        }
+      } else {
+        fbStatus = 'ig_login_token';
+      }
+    } catch (e) {
+      fbStatus = `error: ${e instanceof Error ? e.message.slice(0, 120) : String(e).slice(0, 120)}`;
+    }
+
     // Состояние: тайтл опубликован
     await db.from('rate_limits').insert({
       bucket_key: `/ig/posted/${candidate.vost_id}`,
-      ip: JSON.stringify({ mediaId, permalink, title, at: new Date().toISOString() }).slice(0, 500),
+      ip: JSON.stringify({ mediaId, permalink, title, fbStatus, fbUrl, at: new Date().toISOString() }).slice(0, 500),
     });
-    await igTelemetry(db, 'ok', { vost_id: candidate.vost_id, title, mediaId, permalink });
+    await igTelemetry(db, 'ok', { vost_id: candidate.vost_id, title, mediaId, permalink, fbStatus });
 
-    logEvent('instagram_auto_posted', { vost_id: candidate.vost_id, title, mediaId }, 'info');
-    void notifyTelegram(
-      `📸 Автопост в Instagram: «${title}»\n${permalink || '(ссылка появится через пару минут)'}\nАккаунт: @${identity.username}`,
-    );
+    logEvent('instagram_auto_posted', { vost_id: candidate.vost_id, title, mediaId, fbStatus }, 'info');
+    const tgLines = [
+      `📸 Автопост: «${title}»`,
+      `IG: ${permalink || '(ссылка появится через пару минут)'}`,
+    ];
+    if (fbUrl) tgLines.push(`📘 Кросспост в Facebook: ${fbUrl}`);
+    tgLines.push(`Аккаунт: @${identity.username}`);
+    void notifyTelegram(tgLines.join('\n'));
 
     // ── 6. Продление токена (кроме facebook-схемы) ────────────────────────
     const fresh2 = await refreshInstagramToken(token);
@@ -290,6 +327,7 @@ async function instagramAutoHandler(request: NextRequest) {
     return NextResponse.json({
       ok: true,
       posted: { title, vost_id: candidate.vost_id, mediaId, permalink, account: identity.username },
+      facebook: { status: fbStatus, url: fbUrl },
       caption,
       cover,
     });

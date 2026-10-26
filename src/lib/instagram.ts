@@ -270,3 +270,64 @@ export function isTokenError(e: unknown): boolean {
   const msg = e instanceof Error ? e.message : String(e);
   return /(access token|token.*(expired|invalid|revoked)|ошибка.*токен|190)/i.test(msg);
 }
+
+/* ── Кросспост в Facebook (та же картинка/подпись на FB-страницу) ────── */
+
+/** Страница Facebook с токеном публикации (для кросспоста). */
+export interface FbPageInfo {
+  pageId: string;
+  pageName: string;
+  pageToken: string;
+}
+
+let fbPageCache: FbPageInfo | null = null;
+
+/**
+ * Найти FB-страницу и её page-токен по классическому FB user-токену.
+ * Предпочитаем страницу с привязанным Instagram-аккаунтом. Page-токен,
+ * полученный по long-lived user-токену, живёт практически бессрочно.
+ * Возвращает null, если страниц нет/нет прав — кросспост штатно пропускается.
+ */
+export async function resolveFacebookPage(token: string): Promise<FbPageInfo | null> {
+  if (fbPageCache) return fbPageCache;
+  try {
+    const pages = await graphGet({ host: FB_HOST, version: 'v21.0' }, 'me/accounts', {
+      fields: 'id,name,access_token,instagram_business_account{id,username}',
+      access_token: token,
+    });
+    const list = (pages?.data as Array<Record<string, unknown>>) || [];
+    const withIg = list.find((p) => p.instagram_business_account) || list[0];
+    if (!withIg?.id || !withIg.access_token) return null;
+    fbPageCache = {
+      pageId: String(withIg.id),
+      pageName: String(withIg.name || ''),
+      pageToken: String(withIg.access_token),
+    };
+    return fbPageCache;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Публикация фото-поста на FB-страницу (POST /{page-id}/photos):
+ * картинка по https-ссылке + подпись. Возвращает post_id вида «страница_пост».
+ */
+export async function publishFacebookPhoto(args: {
+  pageId: string;
+  pageToken: string;
+  imageUrl: string;
+  caption: string;
+}): Promise<string> {
+  const { pageId, pageToken, imageUrl, caption } = args;
+  // Лимит текста поста FB огромный, но режем для единообразия с IG
+  const text = caption.length > 5000 ? caption.slice(0, 4999) + '…' : caption;
+  const d = await graphPost({ host: FB_HOST, version: 'v21.0' }, `${pageId}/photos`, {
+    url: imageUrl,
+    caption: text,
+    access_token: pageToken,
+  });
+  const postId = d?.post_id ? String(d.post_id) : d?.id ? String(d.id) : '';
+  if (!postId) throw new Error('FB API: публикация не прошла (нет post_id)');
+  return postId;
+}
