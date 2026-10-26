@@ -8,8 +8,9 @@
  * Что делает при каждом запуске:
  *   1) Берёт токен (env INSTAGRAM_ACCESS_TOKEN, либо свежий продлённый из
  *      rate_limits /ig/token — автопостер сам продлевает токен, см. либу).
- *   2) Пейсинг: не чаще одного поста в 34 часа (крон ежедневный, фактически
- *      пост выходит примерно через день). ?force=1 (админ/секрет) — вне очереди.
+ *   2) Пейсинг: интервал ≥2ч + суточный лимит POSTS_PER_DAY (по умолчанию 8,
+ *      env INSTAGRAM_POSTS_PER_DAY; крон дёргает эндпоинт 10 раз в день
+ *      с 6:00 до 24:00 по Москве). ?force=1 (админ/секрет) — вне очереди.
  *   3) Выбирает аниме: свежее (обновлённое за 14 дней), не 18+, с обложкой,
  *      ещё не публиковавшееся; при исчерпании — популярное из всего каталога.
  *   4) Подпись: LLM-копирайтер (если настроен) или шаблон; ссылка на страницу
@@ -43,12 +44,18 @@ import {
 export const dynamic = 'force-dynamic';
 export const maxDuration = 60;
 
-/** Пауза между постами, часов (крон ежедневный → пост раз в ~1.5 дня). */
-const PACE_HOURS = 34;
+/**
+ * Целевое число постов в сутки: env INSTAGRAM_POSTS_PER_DAY, 1..12, по
+ * умолчанию 8. Лимит Instagram — 100 API-постов/24ч (мы сильно ниже);
+ * собственный лимит защищает от спам-паттернов и выгорания ленты.
+ */
+const POSTS_PER_DAY = Math.min(12, Math.max(1, parseInt(process.env.INSTAGRAM_POSTS_PER_DAY || '8', 10) || 8));
+/** Минимальный интервал между постами, часов (равен шагу крона). */
+const PACE_HOURS = 2;
 /** Свежесть тайтла для приоритетного отбора, дней. */
 const FRESH_DAYS = 14;
-/** Сколько прошлых постов помним для защиты от повторов. */
-const POSTED_MEMORY = 150;
+/** Сколько прошлых постов помним для защиты от повторов (8/день ≈ 50 дней). */
+const POSTED_MEMORY = 400;
 
 /** Подпись через LLM-копирайтера (провайдер настраивается env LLM_*). */
 async function buildLlmCaption(a: CatalogRow, fallback: string): Promise<string> {
@@ -151,6 +158,7 @@ async function instagramAutoHandler(request: NextRequest) {
     return NextResponse.json({
       configured: false,
       ok: false,
+      posts_per_day: POSTS_PER_DAY,
       note: 'Добавьте INSTAGRAM_ACCESS_TOKEN в Vercel env (инструкция: download/инструкция-instagram.md) и перезапустите деплой',
     });
   }
@@ -158,24 +166,40 @@ async function instagramAutoHandler(request: NextRequest) {
   if (stored && stored !== token) token = stored; // продлённый токен новее env
 
   try {
-    // ── 2. Пейсинг ────────────────────────────────────────────────────────
+    // ── 2. Пейсинг: интервал между постами + суточный лимит ────────────
     if (!force) {
-      const { data: lastPosts } = await db
+      const { data: recentPosts } = await db
         .from('rate_limits')
         .select('created_at')
         .like('bucket_key', '/ig/posted/%')
         .order('created_at', { ascending: false })
-        .limit(1);
-      const last = lastPosts?.[0]?.created_at;
-      if (last) {
-        const ageH = (Date.now() - new Date(last).getTime()) / 36e5;
+        .limit(50);
+      const times = (recentPosts || [])
+        .map((r) => new Date(r.created_at).getTime())
+        .filter((t) => !Number.isNaN(t));
+
+      // а) не чаще раза в PACE_HOURS (защита от двойного срабатывания)
+      if (times.length) {
+        const ageH = (Date.now() - Math.max(...times)) / 36e5;
         if (ageH < PACE_HOURS) {
           return NextResponse.json({
             ok: true,
             skipped: 'pacing',
-            note: `Последний пост ${ageH.toFixed(1)}ч назад; следующий не раньше чем через ${(PACE_HOURS - ageH).toFixed(1)}ч (?force=1 — вне очереди)`,
+            note: `Последний пост ${ageH.toFixed(1)}ч назад; интервал ${PACE_HOURS}ч (?force=1 — вне очереди)`,
           });
         }
+      }
+
+      // б) не больше POSTS_PER_DAY за скользящие 24 часа
+      const dayAgo = Date.now() - 24 * 3600 * 1000;
+      const last24 = times.filter((t) => t > dayAgo).length;
+      if (last24 >= POSTS_PER_DAY) {
+        return NextResponse.json({
+          ok: true,
+          skipped: 'daily_cap',
+          posts_today: last24,
+          note: `За сутки уже ${last24} постов (лимит ${POSTS_PER_DAY}/день; меняется переменной INSTAGRAM_POSTS_PER_DAY)`,
+        });
       }
     }
 
@@ -199,7 +223,7 @@ async function instagramAutoHandler(request: NextRequest) {
       .neq('image_url', '')
       .gte('updated_at', freshIso)
       .order('score', { ascending: false })
-      .limit(60);
+      .limit(200);
     let candidate = ((fresh || []) as CatalogRow[]).find((a) => !posted.has(String(a.vost_id))) || null;
 
     // Фолбэк: популярное из всего каталога (свежее исчерпано)
@@ -210,8 +234,21 @@ async function instagramAutoHandler(request: NextRequest) {
         .eq('is_adult', false)
         .neq('image_url', '')
         .order('views', { ascending: false })
-        .limit(60);
+        .limit(300);
       candidate = ((popular || []) as CatalogRow[]).find((a) => !posted.has(String(a.vost_id))) || null;
+    }
+
+    // Второй фолбэк: весь каталог по дате обновления (при 8-10 постах/день
+    // свежее+популярное исчерпывается за пару недель)
+    if (!candidate) {
+      const { data: recentAny } = await db
+        .from('anime_catalog')
+        .select(select)
+        .eq('is_adult', false)
+        .neq('image_url', '')
+        .order('updated_at', { ascending: false })
+        .limit(500);
+      candidate = ((recentAny || []) as CatalogRow[]).find((a) => !posted.has(String(a.vost_id))) || null;
     }
     if (!candidate) {
       await igTelemetry(db, 'fail', { reason: 'no_candidates' });

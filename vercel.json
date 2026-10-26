@@ -102,7 +102,7 @@
     },
     {
       "path": "/api/instagram-auto",
-      "schedule": "0 17 * * *"
+      "schedule": "0 3-21/2 * * *"
     }
   ]
 }
