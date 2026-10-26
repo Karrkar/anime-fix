@@ -32,17 +32,23 @@ import crypto from 'crypto';
  *     → атомарное начисление RPC ap_credit → уведомление в Telegram.
  *
  * Безопасность:
- *  - SHA-1 по официальной схеме p2p-incoming (constant-time сравнение)
+ *  - SHA-1 по официальной схеме p2p-incoming/card-incoming (constant-time)
  *  - fail-closed: без YOO_MONEY_SECRET ничего не активируется (503)
  *  - идемпотентность по operation_id И по payment_label (ретраи ЮMoney не
  *    активируют подписку повторно)
+ *
+ * КОМИССИЯ CARD-PLATЁЖЕЙ (фикс 26.10.2026, подтверждено телеметрией: платёж
+ * 100 ₽ → на кошелёк 97.00 ₽): amount в уведомлении — ЗАЧИСЛЕННАЯ сумма,
+ * withdraw_amount — списанная с плательщика. Матчинг цены тарифа ведём по
+ * withdraw_amount (точная сумма плательщика), с фолбэком на amount и
+ * коридор ±6% (стандартная комиссия приёма карт ~3%).
  */
 
 interface YooMoneyNotification {
-  notification_type?: string; // 'p2p-incoming'
+  notification_type?: string; // 'p2p-incoming' | 'card-incoming'
   operation_id?: string;
-  amount?: string;            // строка, напр. "250.00"
-  withdraw_amount?: string;   // сумма списанная с плательщика
+  amount?: string;            // строка, напр. "250.00" — зачислено на кошелёк
+  withdraw_amount?: string;   // списано с плательщика (для card-incoming с комиссией)
   currency?: string;          // '643' (RUB)
   datetime?: string;
   sender?: string;
@@ -113,7 +119,8 @@ async function telemetry(n: Partial<YooMoneyNotification> | null, verdict: strin
       sender: n?.sender || '',
       codepro: n?.codepro || '',
       hash: n?.sha1_hash ? 'yes' : 'no',
-    }).slice(0, 300);
+      wa: (n?.withdraw_amount || '').slice(0, 12),
+    }).slice(0, 320);
     await db.from('rate_limits').insert({
       bucket_key: `/ymn/${verdict}/${Date.now()}`,
       ip: summary,
@@ -122,28 +129,42 @@ async function telemetry(n: Partial<YooMoneyNotification> | null, verdict: strin
 }
 
 /**
- * Ищем самый свежий PENDING-интент с той же суммой за последние 24 часа.
+ * Сумма платежа подходит интенту/тарифу?
+ * Матчим: точное совпадение с зачислением ИЛИ суммой плательщика,
+ * либо коридор ±6% (комиссия card-incoming ~3%, интент хранит цену тарифа).
+ */
+function amountMatches(intentAmount: number, paid: number, payerAmount: number): boolean {
+  const a = Number(intentAmount);
+  if (!Number.isFinite(a) || a <= 0) return false;
+  return Math.abs(a - paid) <= 0.01
+    || Math.abs(a - payerAmount) <= 0.01
+    || (a >= paid * 0.94 && a <= paid * 1.06)
+    || (a >= payerAmount * 0.94 && a <= payerAmount * 1.06);
+}
+
+/**
+ * Ищем самый свежий PENDING-интент с подходящей суммой за последние 24 часа.
  * Защита от отсутствия колонки created_at: фолбэк без временного окна.
  */
-async function findPendingIntent(db: ReturnType<typeof getDb>, paid: number): Promise<PendingIntent | null> {
+async function findPendingIntent(db: ReturnType<typeof getDb>, paid: number, payerAmount: number): Promise<PendingIntent | null> {
   const dayAgo = new Date(Date.now() - 24 * 3600 * 1000).toISOString();
   try {
     const { data, error } = await db
       .from('payments')
-      .select('id, user_id, payment_label')
+      .select('id, user_id, payment_label, amount')
       .eq('operation_id', 'PENDING')
-      .eq('amount', paid)
       .gt('created_at', dayAgo)
       .order('created_at', { ascending: false })
-      .limit(1);
-    if (!error) return (data?.[0] as PendingIntent) ?? null;
+      .limit(50);
+    if (!error) return (data?.find(r => amountMatches(r.amount, paid, payerAmount)) as PendingIntent) ?? null;
   } catch { /* фолбэк ниже */ }
   // Фолбэк: без окна по времени (если created_at нет в схеме)
   const { data } = await db
     .from('payments')
-    .select('id, user_id, payment_label')
+    .select('id, user_id, payment_label, amount')
     .eq('operation_id', 'PENDING')
-    .eq('amount', paid)
+    .in('amount', [paid, payerAmount])
+    .order('created_at', { ascending: false })
     .limit(1);
   return (data?.[0] as PendingIntent) ?? null;
 }
@@ -208,6 +229,11 @@ async function yoomoneyNotifyHandler(request: NextRequest) {
       return new NextResponse('Bad amount', { status: 400 });
     }
 
+    // Сумма плательщика: card-incoming зачисляет сумму за вычетом комиссии
+    // (100 ₽ → 97 ₽). withdraw_amount — сколько реально списали с карты/кошелька.
+    const withdraw = n.withdraw_amount ? Number(n.withdraw_amount) : NaN;
+    const payerAmount = Number.isFinite(withdraw) && withdraw > 0 ? withdraw : paid;
+
     const db = getDb();
 
     // ── 4. Идемпотентность по operation_id (ретраи ЮMoney) ─────────────
@@ -233,7 +259,7 @@ async function yoomoneyNotifyHandler(request: NextRequest) {
         console.error('YooMoney webhook: invalid topup label format', label);
         return new NextResponse('Invalid label', { status: 400 });
       }
-      const ap = Math.round(paid); // 1 AP = 1 ₽; копейки — в пользу платформы
+      const ap = Math.round(payerAmount); // 1 AP = 1 ₽ по сумме плательщика; комиссию платит платформа
       if (ap <= 0) {
         console.error('YooMoney webhook: topup amount too small', amount);
         return new NextResponse('Bad amount', { status: 400 });
@@ -257,7 +283,7 @@ async function yoomoneyNotifyHandler(request: NextRequest) {
         // а подпись SHA-1 гарантиает, что label не подделан: начисляем по нему.
         const { error: payErr } = await db.from('payments').insert({
           user_id: parsedTopup.userId,
-          amount: paid,
+          amount: payerAmount,
           payment_label: label,
           operation_id: opId,
         });
@@ -296,9 +322,11 @@ async function yoomoneyNotifyHandler(request: NextRequest) {
         return new NextResponse('Invalid plan', { status: 400 });
       }
 
-      // Сверка суммы с ценой тарифа
-      if (Math.abs(paid - plan.price) > 0.01) {
-        logEvent('webhook_amount_mismatch', { paid: amount, expected: plan.price, planId: parsed.planId, label }, 'warn');
+      // Сверка суммы с ценой тарифа: по сумме плательщика (withdraw_amount),
+      // зачислению (amount) или коридору комиссии ±6% (100 ₽ → 97 ₽ — валидно)
+      if (!amountMatches(plan.price, paid, payerAmount)) {
+        logEvent('webhook_amount_mismatch', { paid, payerAmount, withdraw: n.withdraw_amount || '', expected: plan.price, planId: parsed.planId, label }, 'warn');
+        await telemetry(n, 'amount_mismatch');
         return new NextResponse('Amount mismatch', { status: 403 });
       }
 
@@ -342,7 +370,7 @@ async function yoomoneyNotifyHandler(request: NextRequest) {
 
       const { error: payErr } = await db.from('payments').insert({
         user_id: user.id,
-        amount: paid,
+        amount: payerAmount,
         payment_label: label,
         operation_id: opId,
       });
@@ -358,8 +386,8 @@ async function yoomoneyNotifyHandler(request: NextRequest) {
     }
 
     // ── 7. ПУТЬ 2: label пустой (персональная страница /to/) ───────────
-    // Матчинг: самый свежий PENDING-интент с той же суммой за 24 часа.
-    const pending = await findPendingIntent(db, paid);
+    // Матчинг: самый свежий PENDING-интент с подходящей суммой за 24 часа.
+    const pending = await findPendingIntent(db, paid, payerAmount);
     if (!pending) {
       // Платёж реальный, но сопоставить некому — НЕ отдаём ошибку, чтобы
       // ЮMoney не ретраил впустую; администратор увидит запись в логах.
@@ -371,7 +399,7 @@ async function yoomoneyNotifyHandler(request: NextRequest) {
     // Интент пополнения баланса (topup_) без label: пополняем баланс владельцу
     if (pending.payment_label && pending.payment_label.startsWith('topup_')) {
       const pt = parseTopupLabel(pending.payment_label);
-      const ap = Math.round(paid);
+      const ap = Math.round(payerAmount);
       if (pt && ap > 0) {
         await db.from('payments').update({ operation_id: opId }).eq('id', pending.id);
         try {
@@ -397,7 +425,7 @@ async function yoomoneyNotifyHandler(request: NextRequest) {
     const parsed = pending.payment_label ? parseLabel(pending.payment_label) : null;
     if (parsed) planId = parsed.planId;
     let plan = planId ? getPlanById(planId) : null;
-    if (!plan) plan = PLANS.find(p => Math.abs(p.price - paid) <= 0.01) || null;
+    if (!plan) plan = PLANS.find(p => amountMatches(p.price, paid, payerAmount)) || null;
     if (!plan) {
       logEvent('webhook_unmatched', { amount: paid, reason: 'no_plan_for_amount', operationId: operation_id || '—' }, 'warn');
       await telemetry(n, 'unmatched_no_plan');
