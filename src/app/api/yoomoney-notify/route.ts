@@ -95,6 +95,33 @@ interface PendingIntent {
 }
 
 /**
+ * ТЕЛЕМЕТРИЯ (fix 26.10.2026): юMoney-уведомления доходят (rate_limits
+ * фиксировал вызовы с IP юMoney), но ни один реальный платёж за историю
+ * не активирован (49 PENDING, 0 подтверждений). Без Vercel-логов причину
+ * не видно, поэтому каждое уведомление + вердикт обработки пишем в
+ * rate_limits (bucket /ymn/<вердикт>/<ms>) — читается из БД.
+ */
+async function telemetry(n: Partial<YooMoneyNotification> | null, verdict: string): Promise<void> {
+  try {
+    const db = getDb();
+    const summary = JSON.stringify({
+      type: n?.notification_type || '',
+      op: n?.operation_id || '',
+      amount: n?.amount || '',
+      curr: n?.currency || '',
+      label: (n?.label || '').slice(0, 60),
+      sender: n?.sender || '',
+      codepro: n?.codepro || '',
+      hash: n?.sha1_hash ? 'yes' : 'no',
+    }).slice(0, 300);
+    await db.from('rate_limits').insert({
+      bucket_key: `/ymn/${verdict}/${Date.now()}`,
+      ip: summary,
+    });
+  } catch { /* телеметрия не должна ломать вебхук */ }
+}
+
+/**
  * Ищем самый свежий PENDING-интент с той же суммой за последние 24 часа.
  * Защита от отсутствия колонки created_at: фолбэк без временного окна.
  */
@@ -127,6 +154,7 @@ async function yoomoneyNotifyHandler(request: NextRequest) {
     const secret = process.env.YOO_MONEY_SECRET;
     if (!secret) {
       console.error('YooMoney webhook: YOO_MONEY_SECRET не задан — уведомления отклоняются (fail-closed). Активация подписок невозможна.');
+      await telemetry(null, 'no_secret');
       return new NextResponse('Server not configured', { status: 503 });
     }
 
@@ -142,31 +170,41 @@ async function yoomoneyNotifyHandler(request: NextRequest) {
     const { label, amount, currency, operation_id, notification_type } = n;
 
     if (!amount) {
+      await telemetry(n, 'no_amount');
       return new NextResponse('Bad request', { status: 400 });
     }
 
     // ── 2. Официальная проверка SHA-1 (обязательно, label может быть пустым) ──
     if (!n.sha1_hash) {
       logEvent('webhook_missing_hash', { label: label || '—' }, 'warn');
+      await telemetry(n, 'no_hash');
       return new NextResponse('Missing hash', { status: 403 });
     }
     if (!verifyNotificationHash(n, secret)) {
       logEvent('webhook_invalid_hash', { label: label || '—', operationId: operation_id || '—' }, 'warn');
+      await telemetry(n, 'invalid_hash');
       return new NextResponse('Invalid hash', { status: 403 });
     }
 
     // ── 3. Тип операции и валюта ────────────────────────────────────────
-    if (notification_type && notification_type !== 'p2p-incoming') {
+    // Оба типа валидны: p2p-incoming (перевод из кошелька юMoney) и
+    // card-incoming (перевод с банковской карты — все платежи по нашим
+    // quickpay-ссылкам с paymentType=AC). Формула подписи одна и та же.
+    const VALID_TYPES = ['p2p-incoming', 'card-incoming'];
+    if (notification_type && !VALID_TYPES.includes(notification_type)) {
       console.error('YooMoney webhook: unexpected notification_type', notification_type);
+      await telemetry(n, `bad_type_${notification_type}`);
       return new NextResponse('Unexpected notification type', { status: 400 });
     }
     if (currency && currency !== '643') {
       console.error('YooMoney webhook: unexpected currency', currency);
+      await telemetry(n, `bad_currency_${currency}`);
       return new NextResponse('Unexpected currency', { status: 400 });
     }
 
     const paid = Number(amount);
     if (!Number.isFinite(paid)) {
+      await telemetry(n, 'bad_amount');
       return new NextResponse('Bad amount', { status: 400 });
     }
 
@@ -181,6 +219,7 @@ async function yoomoneyNotifyHandler(request: NextRequest) {
         .maybeSingle();
       if (byOp) {
         console.log(`YooMoney webhook: duplicate operation ${operation_id}, skipping`);
+        await telemetry(n, 'duplicate_op');
         return new NextResponse('OK (duplicate)', { status: 200 });
       }
     }
@@ -279,6 +318,7 @@ async function yoomoneyNotifyHandler(request: NextRequest) {
         await db.from('payments').update({ operation_id: opId }).eq('id', intent.id);
         await activateSubscription(intent.user_id, parsed.planId);
         logEvent('webhook_activated', { via: 'label', email: maskEmail(parsed.email), planId: parsed.planId, amount, label });
+        await telemetry(n, 'activated_label');
         return new NextResponse('OK', { status: 200 });
       }
 
@@ -313,6 +353,7 @@ async function yoomoneyNotifyHandler(request: NextRequest) {
 
       await activateSubscription(user.id, parsed.planId);
       logEvent('webhook_activated', { via: 'label-legacy', email: maskEmail(parsed.email), planId: parsed.planId, amount, label });
+      await telemetry(n, 'activated_label_legacy');
       return new NextResponse('OK', { status: 200 });
     }
 
@@ -323,6 +364,7 @@ async function yoomoneyNotifyHandler(request: NextRequest) {
       // Платёж реальный, но сопоставить некому — НЕ отдаём ошибку, чтобы
       // ЮMoney не ретраил впустую; администратор увидит запись в логах.
       logEvent('webhook_unmatched', { amount: paid, operationId: operation_id || '—' }, 'warn');
+      await telemetry(n, 'unmatched');
       return new NextResponse('OK (unmatched)', { status: 200 });
     }
 
@@ -346,6 +388,7 @@ async function yoomoneyNotifyHandler(request: NextRequest) {
       }
       // Битый topup-label в интенте — не матчим на тариф ниже
       logEvent('webhook_unmatched', { amount: paid, reason: 'bad_topup_intent', operationId: operation_id || '—' }, 'warn');
+      await telemetry(n, 'unmatched_bad_topup');
       return new NextResponse('OK (unmatched)', { status: 200 });
     }
 
@@ -357,12 +400,14 @@ async function yoomoneyNotifyHandler(request: NextRequest) {
     if (!plan) plan = PLANS.find(p => Math.abs(p.price - paid) <= 0.01) || null;
     if (!plan) {
       logEvent('webhook_unmatched', { amount: paid, reason: 'no_plan_for_amount', operationId: operation_id || '—' }, 'warn');
+      await telemetry(n, 'unmatched_no_plan');
       return new NextResponse('OK (unmatched)', { status: 200 });
     }
 
     await db.from('payments').update({ operation_id: opId }).eq('id', pending.id);
     await activateSubscription(pending.user_id, plan.id);
     logEvent('webhook_activated', { via: 'amount-match', planId: plan.id, amount, label: pending.payment_label || '—' });
+    await telemetry(n, 'activated_amount_match');
     return new NextResponse('OK', { status: 200 });
   } catch (e) {
     console.error('YooMoney webhook error:', e)
