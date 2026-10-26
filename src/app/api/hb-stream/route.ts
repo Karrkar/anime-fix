@@ -33,6 +33,7 @@ export const maxDuration = 60;
 const ALLOWED_HOSTS: readonly string[] = SOURCES.hentaibaza.hosts;
 
 const CHUNK_BYTES = 4 * 1024 * 1024;   // клиенту за вызов (лимит ответа Vercel ~4.5 МБ)
+const FIRST_CHUNK_BYTES = 512 * 1024;  // первый запрос bytes=0-: маленький чанк — первый кадр за 1-2с, дальше <video> сам просит большие
 const LANES = 4;                        // параллельных соединений к CDN
 const LANE_TIMEOUT_MS = 20_000;         // на попытку; одна повторная = до 40с (лимит функции 60с)
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
@@ -127,10 +128,12 @@ async function hbStreamHandler(request: NextRequest): Promise<NextResponse> {
     return NextResponse.json({ error: 'Host not allowed' }, { status: 403 });
   }
 
-  // Диапазон клиента → наш чанк не длиннее CHUNK_BYTES
+  // Диапазон клиента → наш чанк не длиннее CHUNK_BYTES;
+  // запрос начала файла (bytes=0-) отдаём коротким куском — быстрый первый кадр
   const cr = parseClientRange(request.headers.get('range'));
   const start = cr ? cr.start : 0;
-  const end = cr && cr.end !== null ? Math.min(cr.end, start + CHUNK_BYTES - 1) : start + CHUNK_BYTES - 1;
+  const maxChunk = start === 0 && (!cr || cr.end === null) ? FIRST_CHUNK_BYTES : CHUNK_BYTES;
+  const end = cr && cr.end !== null ? Math.min(cr.end, start + maxChunk - 1) : start + maxChunk - 1;
 
   try {
     // Диапазон → LANES полос по ~1 МБ, все параллельно
