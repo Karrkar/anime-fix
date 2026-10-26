@@ -365,10 +365,17 @@ async function yoomoneyNotifyHandler(request: NextRequest) {
         void notifyTelegram(`💰 Пополнение баланса: +${ap} AP (${amount} ₽)\nБаланс после: ${newBalance} AP`);
         return new NextResponse('OK', { status: 200 });
       } catch (e) {
-        // ap_credit RPC нет (миграция не применена) или ошибка БД —
+        // ap_credit RPC нет (миграция ШАГ1 не применена) или ошибка БД —
         // платёж записан, но не начислен: 500 → ЮMoney ретраит уведомление,
-        // после применения миграции начисление пройдёт.
+        // после применения миграции начисление пройдёт. Кричим владельцу —
+        // молча терять деньги пользователей нельзя.
         console.error('YooMoney webhook: topup credit failed', e);
+        void notifyTelegram(
+          `⚠️ ТОПАП ОПЛАЧЕН, НО НЕ ЗАЧИСЛЕН: +${ap} AP (${amount} ₽, ${label}).\n` +
+          `Причина: ${e instanceof Error ? e.message.slice(0, 150) : 'БД'}.\n` +
+          'Примените миграцию ШАГ1 (таблицы баланса) в Supabase SQL Editor — ретраи ЮMoney зачислят сами. ' +
+          'Если ретраи иссякли — начислите вручную (user_id в платеже).',
+        );
         return new NextResponse('Credit failed', { status: 500 });
       }
     }
@@ -474,6 +481,11 @@ async function yoomoneyNotifyHandler(request: NextRequest) {
           void notifyTelegram(`💰 Пополнение баланса: +${ap} AP (${amount} ₽)\nБаланс после: ${newBalance} AP`);
         } catch (e) {
           console.error('YooMoney webhook: topup credit (amount-match) failed', e);
+          void notifyTelegram(
+            `⚠️ ТОПАП ОПЛАЧЕН, НО НЕ ЗАЧИСЛЕН (матчинг по сумме): +${ap} AP (${amount} ₽, user ${pt.userId}).\n` +
+            `Причина: ${e instanceof Error ? e.message.slice(0, 150) : 'БД'}.\n` +
+            'Примените миграцию ШАГ1 (таблицы баланса) в Supabase SQL Editor — ретраи ЮMoney зачислят сами.',
+          );
           return new NextResponse('Credit failed', { status: 500 });
         }
         return new NextResponse('OK', { status: 200 });
