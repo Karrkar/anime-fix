@@ -32,7 +32,8 @@ import crypto from 'crypto';
  *     → атомарное начисление RPC ap_credit → уведомление в Telegram.
  *
  * Безопасность:
- *  - SHA-1 по официальной схеме p2p-incoming/card-incoming (constant-time)
+ *  - Подпись уведомления: НОВАЯ `sign` (HMAC-SHA256, с 18.05.2026 ЮMoney
+ *    отключил sha1_hash) + легаси sha1_hash для старых ретраев (constant-time)
  *  - fail-closed: без YOO_MONEY_SECRET ничего не активируется (503)
  *  - идемпотентность по operation_id И по payment_label (ретраи ЮMoney не
  *    активируют подписку повторно)
@@ -54,7 +55,10 @@ interface YooMoneyNotification {
   sender?: string;
   codepro?: string;           // 'false'
   label?: string;
-  sha1_hash?: string;
+  sha1_hash?: string;        // легаси-подпись SHA-1 (ЮMoney отключил с 18.05.2026)
+  sign?: string;             // НОВАЯ подпись HMAC-SHA256 (с 18.05.2026 — единственная)
+  test_notification?: string | boolean; // тестовое уведомление (кнопка «Протестировать»)
+  unaccepted?: string;
 }
 
 function verifyNotificationHash(n: YooMoneyNotification, secret: string): boolean {
@@ -82,6 +86,40 @@ function verifyNotificationHash(n: YooMoneyNotification, secret: string): boolea
     return false;
   }
   return crypto.timingSafeEqual(a, b);
+}
+
+/** RFC 3986 URL-кодирование значения (encodeURIComponent не кодирует !'()* ) */
+function rfc3986Encode(v: string): string {
+  return encodeURIComponent(v).replace(/[!'()*]/g, (c) => '%' + c.charCodeAt(0).toString(16).toUpperCase());
+}
+
+/**
+ * НОВАЯ подпись уведомлений ЮMoney (fix 26.10.2026, официальная документация
+ * «Уведомление о входящем переводе» — Certification of authenticity):
+ *   sign = HEX( HMAC-SHA256( secret, canonical ) )
+ *   canonical = «k1=v1&k2=v2&…» — ВСЕ поля уведомления, кроме самого sign,
+ *   отсортированные по алфавиту; значения — RFC 3986 URL-encoding;
+ *   пустые значения остаются «k=». Результат — hex в нижнем регистре.
+ * sha1_hash отключён ЮMoney с 18.05.2026 — без поддержки sign вебхук
+ * отвергал бы даже корректно подписанные уведомления.
+ */
+function computeNotificationSign(params: Record<string, string>, secret: string): string {
+  const canonical = Object.keys(params)
+    .filter((k) => k !== 'sign')
+    .sort()
+    .map((k) => `${k}=${rfc3986Encode(params[k] ?? '')}`)
+    .join('&');
+  return crypto.createHmac('sha256', secret).update(canonical, 'utf8').digest('hex');
+}
+
+function timingSafeEq(a: string, b: string): boolean {
+  const bufA = Buffer.from(a, 'utf8');
+  const bufB = Buffer.from(b, 'utf8');
+  if (bufA.length !== bufB.length) {
+    crypto.timingSafeEqual(bufB, bufB); // выравниваем время сравнения
+    return false;
+  }
+  return crypto.timingSafeEqual(bufA, bufB);
 }
 
 /** Парсим planId и email из label вида ap_{planId}_{email}_{timestamp} */
@@ -119,6 +157,8 @@ async function telemetry(n: Partial<YooMoneyNotification> | null, verdict: strin
       sender: n?.sender || '',
       codepro: n?.codepro || '',
       hash: n?.sha1_hash ? 'yes' : 'no',
+      sign: n?.sign ? 'yes' : 'no',
+      test: n?.test_notification ? 'yes' : 'no',
       wa: (n?.withdraw_amount || '').slice(0, 12),
     }).slice(0, 320);
     await db.from('rate_limits').insert({
@@ -182,29 +222,53 @@ async function yoomoneyNotifyHandler(request: NextRequest) {
     // ЮMoney присылает уведомление как application/x-www-form-urlencoded.
     // Поддерживаем формально и JSON — на случай ручных тестов.
     const raw = await request.text();
+    // Исходные пары «ключ=значение» — для проверки sign нужны ВСЕ поля
+    // уведомления (включая неизвестные интерфейсу ниже), а не только типизированные.
+    let rawParams: Record<string, string> = {};
     let n: YooMoneyNotification;
     try {
-      n = JSON.parse(raw) as YooMoneyNotification;
+      const parsed = JSON.parse(raw) as Record<string, unknown>;
+      rawParams = Object.fromEntries(Object.entries(parsed).map(([k, v]) => [k, String(v ?? '')]));
+      n = parsed as unknown as YooMoneyNotification;
     } catch {
-      n = Object.fromEntries(new URLSearchParams(raw).entries()) as YooMoneyNotification;
+      rawParams = Object.fromEntries(new URLSearchParams(raw).entries());
+      n = rawParams as unknown as YooMoneyNotification;
     }
     const { label, amount, currency, operation_id, notification_type } = n;
+
+    // Кнопка «Протестировать» в настройках HTTP-уведомлений ЮMoney шлёт ПУСТОЕ
+    // уведомление (без amount/label) — подтверждаем доступность, ничего не активируя.
+    if (String(n.test_notification ?? '') === 'true' || n.test_notification === true) {
+      await telemetry(n, 'test_notification');
+      return new NextResponse('OK (test)', { status: 200 });
+    }
 
     if (!amount) {
       await telemetry(n, 'no_amount');
       return new NextResponse('Bad request', { status: 400 });
     }
 
-    // ── 2. Официальная проверка SHA-1 (обязательно, label может быть пустым) ──
-    if (!n.sha1_hash) {
-      logEvent('webhook_missing_hash', { label: label || '—' }, 'warn');
-      await telemetry(n, 'no_hash');
-      return new NextResponse('Missing hash', { status: 403 });
-    }
-    if (!verifyNotificationHash(n, secret)) {
-      logEvent('webhook_invalid_hash', { label: label || '—', operationId: operation_id || '—' }, 'warn');
-      await telemetry(n, 'invalid_hash');
-      return new NextResponse('Invalid hash', { status: 403 });
+    // ── 2. Проверка подписи ──────────────────────────────────────────────
+    // С 18.05.2026 ЮMoney подписывает уведомления параметром sign
+    // (HMAC-SHA256, см. computeNotificationSign). Легаси sha1_hash оставлен
+    // на случай старых ретраев — формула не изменилась.
+    const signGiven = typeof n.sign === 'string' ? n.sign.toLowerCase() : '';
+    if (signGiven) {
+      if (!timingSafeEq(signGiven, computeNotificationSign(rawParams, secret))) {
+        logEvent('webhook_invalid_sign', { label: label || '—', operationId: operation_id || '—' }, 'warn');
+        await telemetry(n, 'invalid_sign');
+        return new NextResponse('Invalid signature', { status: 403 });
+      }
+    } else if (n.sha1_hash) {
+      if (!verifyNotificationHash(n, secret)) {
+        logEvent('webhook_invalid_hash', { label: label || '—', operationId: operation_id || '—' }, 'warn');
+        await telemetry(n, 'invalid_hash');
+        return new NextResponse('Invalid hash', { status: 403 });
+      }
+    } else {
+      logEvent('webhook_missing_signature', { label: label || '—' }, 'warn');
+      await telemetry(n, 'no_signature');
+      return new NextResponse('Missing signature', { status: 403 });
     }
 
     // ── 3. Тип операции и валюта ────────────────────────────────────────
