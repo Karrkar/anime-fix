@@ -261,7 +261,13 @@ function playerPage(videoUrl: string, posterUrl: string): string {
         try{
           var base=(v.currentSrc||v.src).split('#')[0].replace(/([?&])_r=\\d+/,'');
           fetch(base,{headers:{Range:'bytes=0-1'}}).then(function(r){
-            if(r.status===410){ hardRefresh(); return; }
+            if(r.status===410){
+              // источник перечитываем РОВНО ОДИН раз (иначе цикл перезагрузок:
+              // обновлённая страница снова получит 410 от того же мёртвого файла)
+              if(!didRefresh){ didRefresh=true; hardRefresh(); }
+              else showFatal(true);
+              return;
+            }
             scheduleRetry();
           }).catch(scheduleRetry);
         }catch(e){ scheduleRetry(); }
@@ -281,10 +287,12 @@ function playerPage(videoUrl: string, posterUrl: string): string {
         }
       }
 
-      function showFatal(){
+      function showFatal(removed){
         load.style.display='none';
-        emsg.textContent='Видео недоступно';
-        esmall.textContent='Источник не отвечает или удалил это видео. Попробуйте обновить плеер или вернуться позже.';
+        emsg.textContent=removed?'Видео удалено с источника':'Видео недоступно';
+        esmall.textContent=removed
+          ?'Источник удалил этот файл. Попробуйте другой тайтл или зайдите позже.'
+          :'Источник не отвечает. Попробуйте обновить плеер или вернуться позже.';
         err.style.display='flex';
       }
 
