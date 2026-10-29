@@ -53,9 +53,14 @@ const PREFETCH_LINGER_MS = 15_000;      // максимум «зависания
 const PREFETCH_LANE_TIMEOUT_MS = 12_000; // полосы предзагрузки — без ретраев, не жалко
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 
-/** Кэш предзагруженных чанков (тёплый инстанс): 16 × 4МБ = 64МБ максимум. */
+/** Кэш предзагруженных чанков (тёплый инстанс): 24 слота × 4МБ = 96МБ максимум.
+ *  Хранит ОБЕЩАНИЯ (Promise): запрос, пришедший пока предзагрузка ещё идёт
+ *  (реальный браузер потребляет 4МБ за 2-4с и сразу просит следующий),
+ *  дожидается того же обещания вместо повторной загрузки с CDN — дедупликация
+ *  in-flight запросов. Неудачная предзагрузка резолвится null → обычный путь. */
 interface CachedChunk { buf: Uint8Array<ArrayBuffer>; total: number }
-const NEXT_CACHE = new BoundedTTLCache<string, CachedChunk>(16, 5 * 60 * 1000);
+type ChunkPromise = Promise<CachedChunk | null>;
+const NEXT_CACHE = new BoundedTTLCache<string, ChunkPromise>(24, 5 * 60 * 1000);
 
 function cacheKey(url: string, start: number): string {
   return `${url}#${start}`;
@@ -156,18 +161,27 @@ async function fetchChunk(url: string, start: number, end: number, attempts = 2)
 }
 
 /**
- * Предзагрузка следующего чанка (best-effort): без ретраев, результат — в кэш.
- * Время жизни ответа ограничено — race с таймаутом в вызывающей стороне.
+ * Предзагрузка следующего чанка (best-effort, без ретраев): обещание кладётся
+ * в кэш СРАЗУ (до завершения) — конкурентный запрос того же чанка дождётся его.
+ * Ошибка → обещание резолвится null (кэш-промах при чтении → обычная загрузка).
  */
-async function prefetchNextChunk(url: string, nextStart: number): Promise<void> {
-  // Уже в кэше (другой зритель того же файла) — не дёргаем CDN зря
-  if (NEXT_CACHE.get(cacheKey(url, nextStart))) return;
-  try {
-    const chunk = await fetchChunk(url, nextStart, nextStart + CHUNK_BYTES - 1, 1);
-    if (chunk.buf.byteLength > 0 && chunk.total > 0) {
-      NEXT_CACHE.set(cacheKey(url, nextStart), chunk);
+function prefetchNextChunk(url: string, nextStart: number): ChunkPromise {
+  const key = cacheKey(url, nextStart);
+  const existing = NEXT_CACHE.get(key);
+  if (existing) return existing; // уже качается/скачано (другой зритель)
+
+  const p = (async (): Promise<CachedChunk | null> => {
+    try {
+      const chunk = await fetchChunk(url, nextStart, nextStart + CHUNK_BYTES - 1, 1);
+      if (chunk.buf.byteLength > 0 && chunk.total > 0) return chunk;
+      return null;
+    } catch {
+      return null; // предзагрузка не удалась — следующий запрос пойдёт обычным путём
     }
-  } catch { /* предзагрузка не удалась — следующий запрос пойдёт обычным путём */ }
+  })();
+
+  NEXT_CACHE.set(key, p);
+  return p;
 }
 
 async function hbStreamHandler(request: NextRequest): Promise<NextResponse> {
@@ -200,17 +214,23 @@ async function hbStreamHandler(request: NextRequest): Promise<NextResponse> {
   const end = cr && cr.end !== null ? Math.min(cr.end, start + maxChunk - 1) : start + maxChunk - 1;
 
   try {
-    // ── Кэш конвейера: предзагруженный чанк отдаём мгновенно ──
-    const cached = NEXT_CACHE.get(cacheKey(rawUrl, start));
+    // ── Кэш конвейера: предзагруженный (или предзагружаемый СЕЙЧАС) чанк ──
+    const cachedPromise = NEXT_CACHE.get(cacheKey(rawUrl, start));
     let chunk: CachedChunk | null = null;
     let fromCache = false;
-    if (cached && cached.buf.byteLength > 0) {
-      // Кэш может быть «длиннее» запрошенного (браузер попросил меньше) — режем
-      const need = end - start + 1;
-      chunk = cached.buf.byteLength >= need
-        ? { buf: cached.buf.slice(0, need), total: cached.total }
-        : cached;
-      fromCache = true;
+    if (cachedPromise) {
+      const cached = await cachedPromise; // дождаться, если предзагрузка ещё идёт
+      if (cached && cached.buf.byteLength > 0) {
+        // Кэш может быть «длиннее» запрошенного (браузер попросил меньше) — режем
+        const need = end - start + 1;
+        chunk = cached.buf.byteLength >= need
+          ? { buf: cached.buf.slice(0, need), total: cached.total }
+          : cached;
+        fromCache = true;
+      } else {
+        // Неудачная предзагрузка — убираем, чтобы позже была retry-возможность
+        NEXT_CACHE.delete(cacheKey(rawUrl, start));
+      }
     }
 
     if (!chunk) {
