@@ -232,12 +232,19 @@ function playerPage(videoUrl: string, posterUrl: string): string {
       function hideLoad(){load.style.opacity='0';setTimeout(function(){load.style.display='none'},350)}
       function showLoad(text){load.style.display='flex';load.style.opacity='1';lbl.textContent=text}
 
-      // Полный перезапуск: перечитать страницу источника (файл могли перезалить)
-      window.hardRefresh=function(){
-        var u=location.href;
-        if(u.indexOf('refresh=1')<0) u+=(u.indexOf('?')>-1?'&':'?')+'refresh=1';
+      // Автоперезапуск: перечитать страницу источника с обходом кэша
+      // (файл могли перезалить по новой ссылке). На странице, где refresh=1
+      // уже стоит — НИЧЕГО не делает (иначе вечный цикл перезагрузок).
+      // Возвращает true, если началась навигация.
+      function autoRefreshOnce(){
+        if(didRefresh || location.href.indexOf('refresh=1')>-1) return false;
+        didRefresh=true;
+        var u=location.href+(location.href.indexOf('?')>-1?'&':'?')+'refresh=1';
         location.replace(u);
-      };
+        return true;
+      }
+      // Ручная кнопка «Обновить плеер»: всегда честная перезагрузка
+      window.hardRefresh=function(){ location.reload(); };
 
       // Переподключение к стриму С СОХРАНЕНИЕМ ПОЗИЦИИ: браузер сам
       // запросит Range с нужного места, конвейер сервера отдаёт мгновенно
@@ -262,10 +269,9 @@ function playerPage(videoUrl: string, posterUrl: string): string {
           var base=(v.currentSrc||v.src).split('#')[0].replace(/([?&])_r=\\d+/,'');
           fetch(base,{headers:{Range:'bytes=0-1'}}).then(function(r){
             if(r.status===410){
-              // источник перечитываем РОВНО ОДИН раз (иначе цикл перезагрузок:
-              // обновлённая страница снова получит 410 от того же мёртвого файла)
-              if(!didRefresh){ didRefresh=true; hardRefresh(); }
-              else showFatal(true);
+              // источник перечитываем РОВНО ОДИН раз; на обновлённой странице
+              // (refresh=1) autoRefreshOnce — no-op → честное сообщение
+              if(!autoRefreshOnce()) showFatal(true);
               return;
             }
             scheduleRetry();
@@ -277,13 +283,9 @@ function playerPage(videoUrl: string, posterUrl: string): string {
         if(srcTries<MAX_SRC_TRIES){
           retryTimer=setTimeout(reconnect,2500);
           showLoad('Секунду, переподключаемся…');
-        }else if(!didRefresh){
-          // Последняя надежда: файл могли перезалить по новой ссылке —
-          // перечитываем страницу источника с обходом кэша
-          didRefresh=true;
-          hardRefresh();
-        }else{
-          showFatal();
+        }else if(!autoRefreshOnce()){
+          // Последняя надежда была (refresh уже сделан или не нужен) — финал
+          showFatal(false);
         }
       }
 
