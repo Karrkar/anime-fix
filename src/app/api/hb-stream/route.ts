@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { checkAdultAccess } from '@/lib/adult-access'; // 18+ = возраст + подписка
+import { BoundedTTLCache } from '@/lib/cache';
 import { logEvent } from '@/lib/logger';
 import { SOURCES } from '@/lib/sources';
 import { withRateLimit } from '@/lib/with-rate-limit';
@@ -8,19 +9,31 @@ export const dynamic = 'force-dynamic';
 export const maxDuration = 60;
 
 /**
- * УСКОРЕННЫЙ СТРИМИНГ ВИДЕО 18+ С CDN hentaibaza
- * (фикс «серии хентая грузятся больше 2 минут»).
+ * УСКОРЕННЫЙ СТРИМИНГ ВИДЕО 18+ С CDN hentaibaza — v2 «КОНВЕЙЕР»
+ * (фикс «серии хентая грузятся медленно», вторая итерация 29.10.2026).
  *
- * ДИАГНОЗ (замеры 27.10.2026 с боевого CDN cloude.hentaibaza.com):
- *   • файл одной серии ~240 МБ, битрейт ~350 КБ/с;
- *   • CDN режет скорость ПО СОЕДИНЕНИЮ: один поток = 72–157 КБ/с — буфер
- *     НИКОГДА не догоняет воспроизведение, зритель ждёт минуты; при этом
- *     4 параллельных Range-соединения дают ~813 КБ/с (в 5–11 раз быстрее).
+ * ИСТОРИЯ: v1 (27.10) тянула каждый 4МБ-чанк 4 параллельными Range-полосами —
+ * старт серии упал с 2+ минут до ~5-7с, но замеры 29.10 показали тонкий
+ * запас: средняя 0.47 МБ/с при битрейте ~0.23 МБ/с (всего 2x, в ямах 1.4x).
+ * Причина простоя: браузер запрашивает чанки СТРОГО ПО ОЧЕРЕДИ — пока он
+ * качает чанк N с нашего сервера, CDN простаивает, и наоборот; плюс каждый
+ * чанк = 4 новых TLS-соединения к CDN (serverless не переиспользует коннекты).
  *
- * РЕШЕНИЕ: маршрут отдаёт <video> чанки по ~4 МБ (лимит ответа Vercel-функции),
- * но каждый чанк тянет с CDN ЧЕТЫРЬМЯ параллельными Range-соединениями по ~1 МБ
- * и склеивает их по порядку. Эффективная скорость зрителя ×4–5 против прямой
- * ссылки: буфер обгоняет битрейт, серия стартует за секунды, перемотка мгновенная.
+ * v2 — ТРИ изменения:
+ *   1) ПОЛОС БОЛЬШЕ: 8 параллельных Range-соединений на чанк (4МБ/8=512КБ
+ *      на полосу) — быстрее реагируют перемотки и первый кадр;
+ *   2) КОНВЕЙЕР: отдавая чанк N клиенту, СРАЗУ качаем чанк N+1 в кэш
+ *      (спекулятивная предзагрузка). Следующий запрос браузера (он всегда
+ *      идёт по порядку: bytes=<конец N>-) попадает в кэш и обслуживается
+ *      мгновенно, а сервер в это же время качает чанк N+2. CDN и клиент
+ *      работают ПАРАЛЛЕЛЬНО вместо поочерёдного ожидания: эффективная
+ *      скорость = max(CDN, клиент) вместо min — буфер растёт без пауз;
+ *   3) Кэш чанков в памяти тёплого инстанса (BoundedTTLCache: 16 × 4МБ,
+ *      TTL 5 мин) — переживает соседние вызовы на том же инстансе.
+ *
+ * ГАРАНТИИ ЗАВЕРШЕНИЯ: предзагрузка не держит ответ дольше 15с (race с
+ * таймаутом) — суммарный бюджет вызова ≤ ~55с при лимите 60с; неудачная
+ * предзагрузка просто пропускается (следующий запрос пойдёт обычным путём).
  *
  * Используется страницей плеера /api/hb-player (video src = этот маршрут).
  *
@@ -33,10 +46,20 @@ export const maxDuration = 60;
 const ALLOWED_HOSTS: readonly string[] = SOURCES.hentaibaza.hosts;
 
 const CHUNK_BYTES = 4 * 1024 * 1024;   // клиенту за вызов (лимит ответа Vercel ~4.5 МБ)
-const FIRST_CHUNK_BYTES = 512 * 1024;  // первый запрос bytes=0-: маленький чанк — первый кадр за 1-2с, дальше <video> сам просит большие
-const LANES = 4;                        // параллельных соединений к CDN
-const LANE_TIMEOUT_MS = 20_000;         // на попытку; одна повторная = до 40с (лимит функции 60с)
+const FIRST_CHUNK_BYTES = 512 * 1024;  // первый запрос bytes=0-: маленький чанк — первый кадр за 1-2с (moov ~400КБ в начале)
+const LANES = 8;                        // параллельных соединений к CDN на чанк
+const LANE_TIMEOUT_MS = 20_000;         // на попытку основной загрузки; одна повторная = до 40с
+const PREFETCH_LINGER_MS = 15_000;      // максимум «зависания» ответа ради предзагрузки следующего чанка
+const PREFETCH_LANE_TIMEOUT_MS = 12_000; // полосы предзагрузки — без ретраев, не жалко
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+
+/** Кэш предзагруженных чанков (тёплый инстанс): 16 × 4МБ = 64МБ максимум. */
+interface CachedChunk { buf: Uint8Array<ArrayBuffer>; total: number }
+const NEXT_CACHE = new BoundedTTLCache<string, CachedChunk>(16, 5 * 60 * 1000);
+
+function cacheKey(url: string, start: number): string {
+  return `${url}#${start}`;
+}
 
 function isAllowedHost(url: string): boolean {
   try {
@@ -65,16 +88,17 @@ function totalFromContentRange(cr: string | null): number | null {
   return m ? parseInt(m[1], 10) : null;
 }
 
-type Lane = { buf: Uint8Array; total: number | null };
+type Lane = { buf: Uint8Array<ArrayBuffer>; total: number | null };
 
 /**
  * Одна «полоса» параллельной загрузки: Range start..end с CDN.
- * Буферизация в память (≤1 МБ на полосу). При таймауте/сбое — один ретрай.
+ * Буферизация в память (≤1 МБ на полосу). attempts=0 — без ретраев (предзагрузка).
  */
-async function fetchLane(url: string, start: number, end: number): Promise<Lane> {
+async function fetchLane(url: string, start: number, end: number, attempts = 2): Promise<Lane> {
   const want = end - start + 1;
+  const tries = Math.max(1, attempts);
   let lastErr: unknown = null;
-  for (let attempt = 0; attempt < 2; attempt++) {
+  for (let attempt = 0; attempt < tries; attempt++) {
     try {
       const res = await fetch(url, {
         headers: {
@@ -83,7 +107,7 @@ async function fetchLane(url: string, start: number, end: number): Promise<Lane>
           'Referer': `${SOURCES.hentaibaza.base}/`,
           'Range': `bytes=${start}-${end}`,
         },
-        signal: AbortSignal.timeout(LANE_TIMEOUT_MS),
+        signal: AbortSignal.timeout(attempts <= 1 ? PREFETCH_LANE_TIMEOUT_MS : LANE_TIMEOUT_MS),
       });
       // Редирект не должен уводить с разрешённого хоста (SSRF-гигиена)
       if (!isAllowedHost(res.url)) throw new Error('redirect to foreign host');
@@ -93,9 +117,9 @@ async function fetchLane(url: string, start: number, end: number): Promise<Lane>
       if (contentType.startsWith('text/')) throw new Error('not a media file (challenge?)');
 
       const total = totalFromContentRange(res.headers.get('content-range'));
-      const raw = new Uint8Array(await res.arrayBuffer());
+      const raw = new Uint8Array(await res.arrayBuffer()) as Uint8Array<ArrayBuffer>;
       // 200 без Range-поддержки: отрезаем запрошенный кусок от начала
-      const buf = res.status === 200 && raw.byteLength > want ? raw.slice(0, want) : raw;
+      const buf: Uint8Array<ArrayBuffer> = res.status === 200 && raw.byteLength > want ? raw.slice(0, want) : raw;
       if (buf.byteLength === 0) throw new Error('empty lane');
       return { buf, total };
     } catch (e) {
@@ -103,6 +127,47 @@ async function fetchLane(url: string, start: number, end: number): Promise<Lane>
     }
   }
   throw lastErr instanceof Error ? lastErr : new Error('lane failed');
+}
+
+/** Диапазон → LANES полос, все параллельно → склейка по порядку. */
+async function fetchChunk(url: string, start: number, end: number, attempts = 2): Promise<CachedChunk> {
+  const len = end - start + 1;
+  const laneLen = Math.ceil(len / LANES);
+  const lanes: Array<Promise<Lane>> = [];
+  for (let i = 0; i < LANES; i++) {
+    const ls = start + i * laneLen;
+    if (ls > end) break;
+    const le = Math.min(ls + laneLen - 1, end);
+    lanes.push(fetchLane(url, ls, le, attempts));
+  }
+  const parts = await Promise.all(lanes);
+
+  let size = 0;
+  for (const p of parts) size += p.buf.byteLength;
+  const out = new Uint8Array(size);
+  let off = 0;
+  let total: number | null = null;
+  for (const p of parts) {
+    out.set(p.buf, off);
+    off += p.buf.byteLength;
+    if (total === null) total = p.total;
+  }
+  return { buf: out, total: total ?? 0 };
+}
+
+/**
+ * Предзагрузка следующего чанка (best-effort): без ретраев, результат — в кэш.
+ * Время жизни ответа ограничено — race с таймаутом в вызывающей стороне.
+ */
+async function prefetchNextChunk(url: string, nextStart: number): Promise<void> {
+  // Уже в кэше (другой зритель того же файла) — не дёргаем CDN зря
+  if (NEXT_CACHE.get(cacheKey(url, nextStart))) return;
+  try {
+    const chunk = await fetchChunk(url, nextStart, nextStart + CHUNK_BYTES - 1, 1);
+    if (chunk.buf.byteLength > 0 && chunk.total > 0) {
+      NEXT_CACHE.set(cacheKey(url, nextStart), chunk);
+    }
+  } catch { /* предзагрузка не удалась — следующий запрос пойдёт обычным путём */ }
 }
 
 async function hbStreamHandler(request: NextRequest): Promise<NextResponse> {
@@ -114,8 +179,7 @@ async function hbStreamHandler(request: NextRequest): Promise<NextResponse> {
   const rawUrl = searchParams.get('url');
   if (!rawUrl) return NextResponse.json({ error: 'Missing url' }, { status: 400 });
 
-  // Только прямые ссылки на разрешённых хостах hentaibaza (SSRF-гигиена).
-  // DNS-resolve не нужен: хосты — литералы, редиректы проверяются после fetch.
+  // Только прямые ссылки на разрешённых хостах hentaibaza (SSRF-гигиена)
   let parsed: URL;
   try { parsed = new URL(rawUrl); } catch {
     return NextResponse.json({ error: 'Invalid url' }, { status: 400 });
@@ -136,32 +200,29 @@ async function hbStreamHandler(request: NextRequest): Promise<NextResponse> {
   const end = cr && cr.end !== null ? Math.min(cr.end, start + maxChunk - 1) : start + maxChunk - 1;
 
   try {
-    // Диапазон → LANES полос по ~1 МБ, все параллельно
-    const len = end - start + 1;
-    const laneLen = Math.ceil(len / LANES);
-    const lanes: Array<Promise<Lane>> = [];
-    for (let i = 0; i < LANES; i++) {
-      const ls = start + i * laneLen;
-      if (ls > end) break;
-      const le = Math.min(ls + laneLen - 1, end);
-      lanes.push(fetchLane(rawUrl, ls, le));
+    // ── Кэш конвейера: предзагруженный чанк отдаём мгновенно ──
+    const cached = NEXT_CACHE.get(cacheKey(rawUrl, start));
+    let chunk: CachedChunk | null = null;
+    let fromCache = false;
+    if (cached && cached.buf.byteLength > 0) {
+      // Кэш может быть «длиннее» запрошенного (браузер попросил меньше) — режем
+      const need = end - start + 1;
+      chunk = cached.buf.byteLength >= need
+        ? { buf: cached.buf.slice(0, need), total: cached.total }
+        : cached;
+      fromCache = true;
     }
-    const parts = await Promise.all(lanes);
 
-    // Склейка по порядку (полоса могла вернуться короче — реальный конец чанка)
-    let size = 0;
-    for (const p of parts) size += p.buf.byteLength;
-    const out = new Uint8Array(size);
-    let off = 0;
-    let total: number | null = null;
-    for (const p of parts) {
-      out.set(p.buf, off);
-      off += p.buf.byteLength;
-      if (total === null) total = p.total;
+    if (!chunk) {
+      chunk = await fetchChunk(rawUrl, start, end);
     }
+
+    const size = chunk.buf.byteLength;
+    const total = chunk.total;
+    if (size === 0) throw new Error('empty chunk');
 
     // 416: клиент просил за пределами файла
-    if (total !== null && start >= total) {
+    if (total > 0 && start >= total) {
       return new NextResponse(null, {
         status: 416,
         headers: { 'Content-Range': `bytes */${total}`, 'Accept-Ranges': 'bytes' },
@@ -169,18 +230,42 @@ async function hbStreamHandler(request: NextRequest): Promise<NextResponse> {
     }
 
     const realEnd = start + size - 1;
-    const wholeFile = start === 0 && total !== null && size >= total;
+    const wholeFile = start === 0 && total > 0 && size >= total;
     const headers = new Headers();
     headers.set('Content-Type', 'video/mp4');
     headers.set('Accept-Ranges', 'bytes');
     headers.set('Content-Length', String(size));
     headers.set('Cache-Control', 'no-store'); // частичные ответы не кэшируем
     headers.set('Access-Control-Allow-Origin', '*');
-    if (!wholeFile && total !== null) {
+    if (!wholeFile && total > 0) {
       headers.set('Content-Range', `bytes ${start}-${realEnd}/${total}`);
     }
+    if (fromCache) headers.set('X-HB-Pipeline', 'hit');
 
-    return new NextResponse(out, { status: wholeFile ? 200 : 206, headers });
+    // ── КОНВЕЙЕР: отдаём чанк сразу, а пока клиент его потребляет —
+    // качаем следующий в кэш (стрим держит вызов живым, но ≤ PREFETCH_LINGER_MS).
+    const nextStart = realEnd + 1;
+    const canPrefetch = !wholeFile && (total === 0 || nextStart < total);
+
+    if (!canPrefetch) {
+      return new NextResponse(chunk.buf, { status: wholeFile ? 200 : 206, headers });
+    }
+
+    const body = new ReadableStream<Uint8Array>({
+      async start(controller) {
+        try {
+          controller.enqueue(chunk!.buf);
+          // Задерживаем close() ровно настолько, насколько успевает предзагрузка
+          await Promise.race([
+            prefetchNextChunk(rawUrl, nextStart),
+            new Promise<void>(resolve => setTimeout(resolve, PREFETCH_LINGER_MS)),
+          ]);
+        } catch { /* клиент ушёл (seek/закрытие) — просто завершаем */ }
+        try { controller.close(); } catch { /* уже закрыт */ }
+      },
+    });
+
+    return new NextResponse(body, { status: wholeFile ? 200 : 206, headers });
   } catch (e) {
     // Браузер <video> сам повторит запрос; флаг в логе — для диагностики CDN
     logEvent('hb_stream_error', {
