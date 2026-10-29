@@ -24,13 +24,18 @@ export const dynamic = 'force-dynamic';
  * на mp4 (или принимает mp4 напрямую) и отдаёт СОБСТВЕННУЮ страницу с
  * нативным HTML5-<video>:
  *  - страница живёт на нашем origin → frame-src 'self' пропускает её в iframe;
- *  - 2026-10-27 УСКОРЕНИЕ ЗАПУСКА СЕРИЙ: видео раздаётся через наш же
- *    /api/hb-stream — он тянет каждый чанк с CDN 4 параллельными
- *    Range-соединениями (CDN режет скорость по соединению: 1 поток ≈ 0.1 МБ/с,
- *    4 параллельных ≈ 0.8 МБ/с — буфер обгоняет битрейт, запуск за секунды
- *    вместо минут); preload="auto" — буферизация начинается сразу, не по
- *    клику «play»;
+ *  - видео раздаётся через наш же /api/hb-stream (v3: 4+2 полосы, секвенциальный
+ *    фолбэк — см. комментарий там) — быстрый старт, буфер обгоняет битрейт;
+ *  - preload="auto" — буферизация начинается сразу, не по клику «play»;
  *  - нативные контролы, перемотка, fullscreen.
+ *
+ * 29.10.2026 (фикс «потеряна связь с сервером»):
+ *  - ?refresh=1 — обойти кэш извлечённой ссылки и перечитать страницу
+ *    источника (файл на CDN могли перезалить по новому адресу);
+ *  - страница плеера САМОВОССТАНАВЛИВАЕТСЯ: при сбое стрима переподключается
+ *    с сохранением позиции (до 2 раз), затем один раз перечитывает источник
+ *    (refresh=1), и только потом показывает дружелюбную ошибку — вместо
+ *    мгновенного «чёрного экрана» браузер и его «потеряна связь с сервером».
  *
  * Безопасность (как в остальных adult-маршрутах):
  *  - гейт 18+: возрастная cookie + активная подписка/админ (checkAdultAccess);
@@ -103,6 +108,9 @@ async function hbPlayerHandler(request: NextRequest) {
   try {
     const { searchParams } = new URL(request.url);
     const rawUrl = searchParams.get('url');
+    // refresh=1: перечитать страницу источника, игнорируя кэш ссылки —
+    // файл на CDN могли перезалить (старая ссылка отвечает 404)
+    const forceRefresh = searchParams.get('refresh') === '1';
 
     if (!rawUrl) {
       return new NextResponse(errorPage('Не передана ссылка на видео.'), {
@@ -124,7 +132,7 @@ async function hbPlayerHandler(request: NextRequest) {
 
     // Страница /watch/N — вытаскиваем прямую ссылку на mp4 (с кэшем)
     if (!isDirectVideo(safeUrl)) {
-      const cached = CACHE.get(safeUrl);
+      const cached = forceRefresh ? null : CACHE.get(safeUrl);
       if (cached) {
         videoUrl = cached.videoUrl;
         posterUrl = cached.posterUrl;
@@ -181,7 +189,7 @@ export const GET = withRateLimit(hbPlayerHandler, '/api/hb-player');
 /* ─────────────────── HTML страницы плеера ─────────────────── */
 
 function playerPage(videoUrl: string, posterUrl: string): string {
-  // Видео через наш ускоритель: 4 параллельных соединения к CDN на каждый чанк
+  // Видео через наш ускоритель: 4 полосы + конвейерная предзагрузка + план Б
   const streamSrc = `/api/hb-stream?url=${encodeURIComponent(videoUrl)}`;
   return `<!DOCTYPE html>
 <html lang="ru">
@@ -195,31 +203,101 @@ function playerPage(videoUrl: string, posterUrl: string): string {
     html,body{width:100%;height:100%;overflow:hidden;background:#000}
     #wrap{position:relative;width:100%;height:100%;display:flex;align-items:center;justify-content:center}
     video{width:100%;height:100%;object-fit:contain;background:#000}
-    #load{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,.6);transition:opacity .3s}
+    #load{position:absolute;inset:0;display:flex;flex-direction:column;gap:10px;align-items:center;justify-content:center;background:rgba(0,0,0,.6);transition:opacity .3s}
     #load .spin{width:46px;height:46px;border:3px solid rgba(236,72,153,.25);border-top-color:#ec4899;border-radius:50%;animation:sp 1s linear infinite}
     @keyframes sp{to{transform:rotate(360deg)}}
+    #load .lbl{color:#f9a8d4;font-family:system-ui,sans-serif;font-size:13px}
     #err{position:absolute;inset:0;display:none;flex-direction:column;align-items:center;justify-content:center;gap:12px;background:rgba(0,0,0,.85);color:#f9a8d4;font-family:system-ui,sans-serif;text-align:center;padding:1rem}
     #err b{font-size:15px}
-    #err small{color:#9d174d;font-size:12px}
+    #err small{color:#d48ab0;font-size:12px;max-width:340px;line-height:1.5}
     #err button{margin-top:4px;padding:8px 18px;border:none;border-radius:8px;background:linear-gradient(135deg,#ec4899,#db2777);color:#fff;font-size:14px;cursor:pointer}
   </style>
 </head>
 <body>
   <div id="wrap">
     <video id="v" src="${streamSrc}"${posterUrl ? ` poster="${posterUrl}"` : ''} controls playsinline preload="auto" controlslist="nodownload"></video>
-    <div id="load"><div class="spin"></div></div>
-    <div id="err"><b id="errmsg">Ошибка воспроизведения</b><small>Источник видео недоступен или ссылка устарела</small><button onclick="location.reload()">Обновить</button></div>
+    <div id="load"><div class="spin"></div><div class="lbl" id="loadlbl">Загрузка…</div></div>
+    <div id="err"><b id="errmsg">Ошибка воспроизведения</b><small id="errsmall">Источник видео недоступен или ссылка устарела</small><button onclick="hardRefresh()">Обновить плеер</button></div>
   </div>
   <script>
     (function(){
-      var v=document.getElementById('v'),load=document.getElementById('load'),err=document.getElementById('err');
+      var v=document.getElementById('v'),
+          load=document.getElementById('load'),
+          lbl=document.getElementById('loadlbl'),
+          err=document.getElementById('err'),
+          emsg=document.getElementById('errmsg'),
+          esmall=document.getElementById('errsmall');
+      var srcTries=0, MAX_SRC_TRIES=2, didRefresh=false, retryTimer=null;
+
       function hideLoad(){load.style.opacity='0';setTimeout(function(){load.style.display='none'},350)}
+      function showLoad(text){load.style.display='flex';load.style.opacity='1';lbl.textContent=text}
+
+      // Полный перезапуск: перечитать страницу источника (файл могли перезалить)
+      window.hardRefresh=function(){
+        var u=location.href;
+        if(u.indexOf('refresh=1')<0) u+=(u.indexOf('?')>-1?'&':'?')+'refresh=1';
+        location.replace(u);
+      };
+
+      // Переподключение к стриму С СОХРАНЕНИЕМ ПОЗИЦИИ: браузер сам
+      // запросит Range с нужного места, конвейер сервера отдаёт мгновенно
+      function reconnect(){
+        srcTries++;
+        var t=Math.max(0,v.currentTime||0);
+        var base=(v.currentSrc||v.src).split('#')[0];
+        // срезаем прошлый суффикс ретрая (_r=N), добавляем свежий — иначе
+        // браузер может отдать закэшированный отказ
+        base=base.replace(/([?&])_r=\\d+/,'').replace(/\\?$/,'');
+        var sep=base.indexOf('?')>-1?'&':'?';
+        v.src=base+sep+'_r='+srcTries+'#t='+t;
+        showLoad('Переподключаемся… (попытка '+(srcTries+1)+'/'+(MAX_SRC_TRIES+1)+')');
+        v.load();
+        var p=v.play(); if(p&&p.catch)p.catch(function(){});
+      }
+
+      function probeStatus(){
+        // Однообъёмный запрос к стриму: 410 = файл удалён с источника
+        // (тогда ретраи бессмысленны — сразу перечитываем источник)
+        try{
+          var base=(v.currentSrc||v.src).split('#')[0].replace(/([?&])_r=\\d+/,'');
+          fetch(base,{headers:{Range:'bytes=0-1'}}).then(function(r){
+            if(r.status===410){ hardRefresh(); return; }
+            scheduleRetry();
+          }).catch(scheduleRetry);
+        }catch(e){ scheduleRetry(); }
+      }
+
+      function scheduleRetry(){
+        if(srcTries<MAX_SRC_TRIES){
+          retryTimer=setTimeout(reconnect,2500);
+          showLoad('Секунду, переподключаемся…');
+        }else if(!didRefresh){
+          // Последняя надежда: файл могли перезалить по новой ссылке —
+          // перечитываем страницу источника с обходом кэша
+          didRefresh=true;
+          hardRefresh();
+        }else{
+          showFatal();
+        }
+      }
+
+      function showFatal(){
+        load.style.display='none';
+        emsg.textContent='Видео недоступно';
+        esmall.textContent='Источник не отвечает или удалил это видео. Попробуйте обновить плеер или вернуться позже.';
+        err.style.display='flex';
+      }
+
       v.addEventListener('loadeddata',hideLoad);
       v.addEventListener('canplay',hideLoad);
       v.addEventListener('playing',hideLoad);
-      v.addEventListener('error',function(){load.style.display='none';err.style.display='flex'});
-      v.addEventListener('stalled',function(){load.style.display='flex';load.style.opacity='1'});
-      setTimeout(hideLoad,12000);
+      v.addEventListener('error',function(){
+        clearTimeout(retryTimer);
+        // Пауза-перезапуск без паники: сначала тихо переподключаемся
+        probeStatus();
+      });
+      v.addEventListener('stalled',function(){showLoad('Подгружаем…')});
+      setTimeout(hideLoad,15000);
     })();
   </script>
 </body>

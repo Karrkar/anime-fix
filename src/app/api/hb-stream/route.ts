@@ -9,48 +9,60 @@ export const dynamic = 'force-dynamic';
 export const maxDuration = 60;
 
 /**
- * УСКОРЕННЫЙ СТРИМИНГ ВИДЕО 18+ С CDN hentaibaza — v2 «КОНВЕЙЕР»
- * (фикс «серии хентая грузятся медленно», вторая итерация 29.10.2026).
+ * УСКОРЕННЫЙ СТРИМИНГ ВИДЕО 18+ С CDN hentaibaza — v3 «БЕРЕЖНЫЙ КОНВЕЙЕР»
+ * (фикс «на некоторых тайтлах теряется связь с сервером», 29.10.2026).
  *
- * ИСТОРИЯ: v1 (27.10) тянула каждый 4МБ-чанк 4 параллельными Range-полосами —
- * старт серии упал с 2+ минут до ~5-7с, но замеры 29.10 показали тонкий
- * запас: средняя 0.47 МБ/с при битрейте ~0.23 МБ/с (всего 2x, в ямах 1.4x).
- * Причина простоя: браузер запрашивает чанки СТРОГО ПО ОЧЕРЕДИ — пока он
- * качает чанк N с нашего сервера, CDN простаивает, и наоборот; плюс каждый
- * чанк = 4 новых TLS-соединения к CDN (serverless не переиспользует коннекты).
+ * ИСТОРИЯ:
+ *  v1 (27.10): 4 параллельные Range-полосы на чанк — старт серии упал
+ *    с 2+ минут до ~5-7с.
+ *  v2 (29.10 утро): 8 полос + конвейерная предзагрузка следующего чанка —
+ *    средняя скорость 0.9-1.2 МБ/с в одиночном замере.
+ *  v3 (29.10 день): ЖАЛОБЫ «потеряна связь с сервером» на популярных
+ *    тайтлах. Замеры CDN (scripts/diagnose_hb_cdn_conc.mjs) показали:
+ *    CDN hentaibaza держит с одного IP лишь ~4-6 одновременных соединений —
+ *    8 параллельных = 12% зависаний, 16 = 25%, 32 = 15%+ (соединения не
+ *    отклоняются, а ПОДВИСАЮТ на 15-20с). У одного зрителя v2 открывала
+ *    до 16 соединений (8 полос чанка + 8 полос предзагрузки), два зрителя
+ *    одновременно = 32 → полосы истекали по 20с-таймауту дважды → чанк
+ *    падал → браузер получал 502 посреди просмотра → «потеряна связь».
+ *    Тайтлы «некоторые», потому что ломались именно те, что смотрят
+ *    несколько человек одновременно.
  *
- * v2 — ТРИ изменения:
- *   1) ПОЛОС БОЛЬШЕ: 8 параллельных Range-соединений на чанк (4МБ/8=512КБ
- *      на полосу) — быстрее реагируют перемотки и первый кадр;
- *   2) КОНВЕЙЕР: отдавая чанк N клиенту, СРАЗУ качаем чанк N+1 в кэш
- *      (спекулятивная предзагрузка). Следующий запрос браузера (он всегда
- *      идёт по порядку: bytes=<конец N>-) попадает в кэш и обслуживается
- *      мгновенно, а сервер в это же время качает чанк N+2. CDN и клиент
- *      работают ПАРАЛЛЕЛЬНО вместо поочерёдного ожидания: эффективная
- *      скорость = max(CDN, клиент) вместо min — буфер растёт без пауз;
- *   3) Кэш чанков в памяти тёплого инстанса (BoundedTTLCache: 16 × 4МБ,
- *      TTL 5 мин) — переживает соседние вызовы на том же инстансе.
- *
- * ГАРАНТИИ ЗАВЕРШЕНИЯ: предзагрузка не держит ответ дольше 15с (race с
- * таймаутом) — суммарный бюджет вызова ≤ ~55с при лимите 60с; неудачная
- * предзагрузка просто пропускается (следующий запрос пойдёт обычным путём).
+ * v3 — ЧЕТЫРЕ изменения:
+ *   1) ПОЛОС МЕНЬШЕ: 4 на основной чанк и 2 на предзагрузку (пик 6 против
+ *      16 у v2) — внутри подтверждённого лимита CDN для одиночного зрителя;
+ *      скорость сохраняется конвейером: пока клиент смотрит чанк N,
+ *      предзагрузка уже тащит N+1.
+ *   2) БЫСТРЫЕ ТАЙМАУТЫ: полоса 9с (было 20с) — при перегрузке CDN быстро
+ *      переходим к плану Б вместо 40с простоя.
+ *   3) ПЛАН Б — СЕКВЕНЦИАЛЬНЫЙ ФОЛБЭК: если параллельные полосы упали,
+ *      чанк ДОГРЕБАЕТСЯ одним соединением (одно Range-соединение CDN
+ *      обслуживает всегда — все последовательные замеры 100%). Просмотр
+ *      деградирует до скорости v1, но НЕ УМИРАЕТ: 502 теперь крайний случай.
+ *   4) 410 ДЛЯ МЁРТВЫХ ФАЙЛОВ: если CDN отвечает 404 (файл удалён на
+ *      источнике — бывает, напр. watch/46), возвращаем 410 вместо 502:
+ *      страница плеера по нему не ретраит стрим, а перечитывает страницу
+ *      источника (файл могли перезалить) и в финале честно сообщает
+ *      «видео удалено с источника».
  *
  * Используется страницей плеера /api/hb-player (video src = этот маршрут).
  *
  * Безопасность (как в /api/hb-player):
- *   • гейт 18+ (возраст + активная подписка/админ) — на каждый чанк;
- *   • только прямые ссылки на видео с разрешённых хостов hentaibaza;
- *   • после fetch проверяем итоговый URL (редирект не должен уводить
- *     на чужой хост — иначе ошибка).
+ *  • гейт 18+ (возраст + активная подписка/админ) — на каждый чанк;
+ *  • только прямые ссылки на видео с разрешённых хостов hentaibaza;
+ *  • после fetch проверяем итоговый URL (редирект не должен уводить
+ *    на чужой хост — иначе ошибка).
  */
 const ALLOWED_HOSTS: readonly string[] = SOURCES.hentaibaza.hosts;
 
 const CHUNK_BYTES = 4 * 1024 * 1024;   // клиенту за вызов (лимит ответа Vercel ~4.5 МБ)
 const FIRST_CHUNK_BYTES = 512 * 1024;  // первый запрос bytes=0-: маленький чанк — первый кадр за 1-2с (moov ~400КБ в начале)
-const LANES = 8;                        // параллельных соединений к CDN на чанк
-const LANE_TIMEOUT_MS = 20_000;         // на попытку основной загрузки; одна повторная = до 40с
-const PREFETCH_LINGER_MS = 15_000;      // максимум «зависания» ответа ради предзагрузки следующего чанка
-const PREFETCH_LANE_TIMEOUT_MS = 12_000; // полосы предзагрузки — без ретраев, не жалко
+const LANES = 4;                        // параллельных соединений к CDN на основной чанк (лимит CDN ≈ 4-6 на IP)
+const PREFETCH_LANES = 2;               // полосы предзагрузки — фон, не конкурируем с основным чанком
+const LANE_TIMEOUT_MS = 9_000;          // на попытку основной загрузки; две попытки = до 18с
+const SEQ_FALLBACK_TIMEOUT_MS = 22_000; // одно соединение на весь чанк (план Б)
+const PREFETCH_LINGER_MS = 10_000;      // максимум «зависания» ответа ради предзагрузки следующего чанка
+const PREFETCH_LANE_TIMEOUT_MS = 9_000; // полосы предзагрузки — без ретраев, не жалко
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 
 /** Кэш предзагруженных чанков (тёплый инстанс): 24 слота × 4МБ = 96МБ максимум.
@@ -93,11 +105,17 @@ function totalFromContentRange(cr: string | null): number | null {
   return m ? parseInt(m[1], 10) : null;
 }
 
+/** Ошибка «файл удалён с источника» — фолбэки и ретраи бессмысленны. */
+class PermanentUpstreamError extends Error {
+  constructor(msg: string) { super(msg); this.name = 'PermanentUpstreamError'; }
+}
+
 type Lane = { buf: Uint8Array<ArrayBuffer>; total: number | null };
 
 /**
  * Одна «полоса» параллельной загрузки: Range start..end с CDN.
- * Буферизация в память (≤1 МБ на полосу). attempts=0 — без ретраев (предзагрузка).
+ * Буферизация в память. attempts=0 — без ретраев (предзагрузка).
+ * 404/410 от CDN → PermanentUpstreamError (файл удалён — не ретраим).
  */
 async function fetchLane(url: string, start: number, end: number, attempts = 2): Promise<Lane> {
   const want = end - start + 1;
@@ -116,6 +134,7 @@ async function fetchLane(url: string, start: number, end: number, attempts = 2):
       });
       // Редирект не должен уводить с разрешённого хоста (SSRF-гигиена)
       if (!isAllowedHost(res.url)) throw new Error('redirect to foreign host');
+      if (res.status === 404 || res.status === 410) throw new PermanentUpstreamError(`upstream ${res.status}`);
       if (res.status !== 200 && res.status !== 206) throw new Error(`upstream ${res.status}`);
 
       const contentType = res.headers.get('content-type') || '';
@@ -128,24 +147,26 @@ async function fetchLane(url: string, start: number, end: number, attempts = 2):
       if (buf.byteLength === 0) throw new Error('empty lane');
       return { buf, total };
     } catch (e) {
+      // Файл удалён — дальше не пытаемся (и полосы, и фолбэк бессмысленны)
+      if (e instanceof PermanentUpstreamError) throw e;
       lastErr = e;
     }
   }
   throw lastErr instanceof Error ? lastErr : new Error('lane failed');
 }
 
-/** Диапазон → LANES полос, все параллельно → склейка по порядку. */
-async function fetchChunk(url: string, start: number, end: number, attempts = 2): Promise<CachedChunk> {
+/** Диапазон → lanes полос, все параллельно → склейка по порядку. */
+async function fetchChunkLanes(url: string, start: number, end: number, lanes: number, attempts = 2): Promise<CachedChunk> {
   const len = end - start + 1;
-  const laneLen = Math.ceil(len / LANES);
-  const lanes: Array<Promise<Lane>> = [];
-  for (let i = 0; i < LANES; i++) {
+  const laneLen = Math.ceil(len / lanes);
+  const jobs: Array<Promise<Lane>> = [];
+  for (let i = 0; i < lanes; i++) {
     const ls = start + i * laneLen;
     if (ls > end) break;
     const le = Math.min(ls + laneLen - 1, end);
-    lanes.push(fetchLane(url, ls, le, attempts));
+    jobs.push(fetchLane(url, ls, le, attempts));
   }
-  const parts = await Promise.all(lanes);
+  const parts = await Promise.all(jobs);
 
   let size = 0;
   for (const p of parts) size += p.buf.byteLength;
@@ -160,10 +181,56 @@ async function fetchChunk(url: string, start: number, end: number, attempts = 2)
   return { buf: out, total: total ?? 0 };
 }
 
+/** ПЛАН Б: весь чанк одним соединением — CDN одиночные запросы обслуживает
+ *  всегда (замеры: 100% при последовательном доступе). Медленнее, но надёжно. */
+async function fetchChunkSequential(url: string, start: number, end: number): Promise<CachedChunk> {
+  const res = await fetch(url, {
+    headers: {
+      'User-Agent': UA,
+      'Accept': 'video/*,*/*;q=0.8',
+      'Referer': `${SOURCES.hentaibaza.base}/`,
+      'Range': `bytes=${start}-${end}`,
+    },
+    signal: AbortSignal.timeout(SEQ_FALLBACK_TIMEOUT_MS),
+  });
+  if (!isAllowedHost(res.url)) throw new Error('redirect to foreign host');
+  if (res.status === 404 || res.status === 410) throw new PermanentUpstreamError(`upstream ${res.status}`);
+  if (res.status !== 200 && res.status !== 206) throw new Error(`upstream ${res.status}`);
+
+  const contentType = res.headers.get('content-type') || '';
+  if (contentType.startsWith('text/')) throw new Error('not a media file (challenge?)');
+
+  const total = totalFromContentRange(res.headers.get('content-range'));
+  const raw = new Uint8Array(await res.arrayBuffer()) as Uint8Array<ArrayBuffer>;
+  const want = end - start + 1;
+  const buf: Uint8Array<ArrayBuffer> = res.status === 200 && raw.byteLength > want ? raw.slice(0, want) : raw;
+  if (buf.byteLength === 0) throw new Error('empty sequential chunk');
+  return { buf, total: total ?? 0 };
+}
+
+/** Чанк: сначала параллельные полосы, при неудаче — одно соединение (план Б).
+ *  PermanentUpstreamError (404) пробрасывается сразу, без фолбэка. */
+async function fetchChunk(url: string, start: number, end: number, attempts = 2, lanes = LANES): Promise<CachedChunk> {
+  try {
+    return await fetchChunkLanes(url, start, end, lanes, attempts);
+  } catch (e) {
+    if (e instanceof PermanentUpstreamError) throw e;
+    // Предзагрузке (attempts<=1) фолбэк не положен — не тратим бюджет вызова
+    if (attempts <= 1) throw e;
+    logEvent('hb_stream_fallback', {
+      url: url.slice(0, 200),
+      start,
+      err: e instanceof Error ? e.message.slice(0, 80) : 'unknown',
+    }, 'warn');
+    return await fetchChunkSequential(url, start, end);
+  }
+}
+
 /**
- * Предзагрузка следующего чанка (best-effort, без ретраев): обещание кладётся
- * в кэш СРАЗУ (до завершения) — конкурентный запрос того же чанка дождётся его.
- * Ошибка → обещание резолвится null (кэш-промах при чтении → обычная загрузка).
+ * Предзагрузка следующего чанка (best-effort, 2 полосы, без ретраев):
+ * обещание кладётся в кэш СРАЗУ (до завершения) — конкурентный запрос того
+ * же чанка дождётся его. Ошибка → обещание резолвится null (кэш-промах при
+ * чтении → обычная загрузка).
  */
 function prefetchNextChunk(url: string, nextStart: number): ChunkPromise {
   const key = cacheKey(url, nextStart);
@@ -172,7 +239,7 @@ function prefetchNextChunk(url: string, nextStart: number): ChunkPromise {
 
   const p = (async (): Promise<CachedChunk | null> => {
     try {
-      const chunk = await fetchChunk(url, nextStart, nextStart + CHUNK_BYTES - 1, 1);
+      const chunk = await fetchChunk(url, nextStart, nextStart + CHUNK_BYTES - 1, 1, PREFETCH_LANES);
       if (chunk.buf.byteLength > 0 && chunk.total > 0) return chunk;
       return null;
     } catch {
@@ -287,7 +354,14 @@ async function hbStreamHandler(request: NextRequest): Promise<NextResponse> {
 
     return new NextResponse(body, { status: wholeFile ? 200 : 206, headers });
   } catch (e) {
-    // Браузер <video> сам повторит запрос; флаг в логе — для диагностики CDN
+    // 410: файл удалён с источника — плеер перечитает страницу источника
+    // и честно сообщит, если видео пропало (не «потеря связи», а причина)
+    if (e instanceof PermanentUpstreamError) {
+      logEvent('hb_stream_gone', { url: rawUrl.slice(0, 200), start }, 'warn');
+      return NextResponse.json({ error: 'Gone', gone: true }, { status: 410 });
+    }
+    // Транзитный сбой: браузер <video> сам повторит запрос; флаг в логе —
+    // для диагностики CDN
     logEvent('hb_stream_error', {
       url: rawUrl.slice(0, 200),
       start,
